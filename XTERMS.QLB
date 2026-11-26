@@ -1,0 +1,68 @@
+$IncludeOnce
+
+Dim Shared CONSOLE_COMMAND$
+Dim Shared CONSOLE_IS_AVAILABLE As Integer
+
+
+Sub GET_X_TERMINAL
+    LINUXTERMS:
+    Data "gnome-terminal","konsole","lxterminal","mate-terminal","xfce4-terminal","urxvt","xterm","ptyxis","x-terminal-emulator","LAST"
+    TERM_GOOPT:
+    Data " -- "," -e "," -e "," -x "," -x "," -e "," -e "," -- "," -e "
+
+    Dim TMP$, OPT$
+    Dim RET%
+    Dim I As Integer
+    Dim J As Integer
+
+    $If WINDOWS Then
+        CONSOLE_IS_AVAILABLE = _True
+        CONSOLE_COMMAND$ = "CMD /C "
+        EXIT SUB
+    $Else
+        CONSOLE_COMMAND$ = ""
+    $End If
+
+    Restore LINUXTERMS
+    I = 1
+    Do
+        Read TMP$
+        If IsInstalled(TMP$) Then
+            Restore TERM_GOOPT
+            For J = 1 To I
+                Read OPT$
+            Next
+            CONSOLE_COMMAND$ = TMP$ + OPT$
+            CONSOLE_IS_AVAILABLE = _TRUE
+            Exit Sub
+        End If
+        I = I + 1
+    Loop Until TMP$ = "LAST"
+    CONSOLE_IS_AVAILABLE = _FALSE
+End Sub
+
+Function IsInstalled% (trycmd$)
+    Dim GetInstalled As Integer
+    $If WINDOWS Then
+        GetInstalled = (Shell("where " + trycmd$) = 0)
+    $Else
+        GetInstalled = (Shell("which " + trycmd$) = 0)
+    $End If
+
+    IsInstalled = GetInstalled
+End Function
+
+Sub RUN_INTERMINAL (CMD$)
+    If CONSOLE_IS_AVAILABLE Then
+        Shell _DontWait CONSOLE_COMMAND$ + CMD$
+    End If
+End Sub
+
+Sub RUN_INTERMINAL_WAIT (CMD$)
+    If CONSOLE_IS_AVAILABLE Then
+        Shell CONSOLE_COMMAND$ + CMD$
+    End If
+End Sub
+
+
+GET_X_TERMINAL

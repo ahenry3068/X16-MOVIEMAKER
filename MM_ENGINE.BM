@@ -1,0 +1,4809 @@
+' MM_ENGINE.BM -- the converter engine of X16 Movie Maker (frame loading, dithering,
+' audio, SPV writing).  Taken from MakeX16Movie.bas with the old menus and screens removed.
+Sub Write_VIDEO_HEADER (NumberOfFrames As Long, BLANK_FIRST_AUDIO As Integer)
+    Dim I As Long
+
+    VideoHeader.NumFrames = NumberOfFrames
+
+    Put MainLFN, , VideoHeader
+
+    If MAKE_SECTOR_VIDEO Then
+        PAD_VIDEO_HEADER
+        If DoPadFrame Then
+            ReDim PadBuffer(0 To V_PADSIZE - 1) As _Unsigned _Byte
+            For I = 0 To (V_PADSIZE - 1): PadBuffer(I) = 0: Next
+        End If
+    End If
+
+    If Interleave_Audio Then
+        ' The blank first Audio param is used when parting out  the video
+        ' To multiple files.  Each file must remain valid individually
+        ' But we don't want to shift Audio alignment by a frame for every part !
+        If BLANK_FIRST_AUDIO And (Audio_FrameSize < 2049) Then
+            For I = 0 To UBound(AudioBuffer)
+                AudioBuffer(I) = 0
+            Next
+        Else
+            GetAudioFrame
+        End If
+        Put MainLFN, , AudioBuffer()
+
+        ' If two Audio Frames are less/equal to the 4k size
+        ' of the VERA PCM Fifo then we write two Audio Buffers directly
+        ' after the Header.   The Player will prefill the FIFO on this condition
+        ' No other header info is necessary, Decision is based on Audio Frame Size alone !
+        If Audio_FrameSize < 2049 Then
+            GetAudioFrame
+            Put MainLFN, , AudioBuffer()
+        End If
+    End If
+
+End Sub
+
+Sub POST_PROCESS_PARTVIDEO
+    Dim SRCPAL$
+    Dim TrgPAL$
+    Dim PPath$
+    Dim SAudFile$
+    Dim OutAudFile$
+    Dim CMD$
+    Dim PartHEADER As SVIDHeaderType
+    Dim I As Long
+    Dim J As Long
+    Dim Fr_Count As _Unsigned Long
+
+    _Dest _Console
+    Print: Print
+    PPath$ = GetFilePath(MovieName$) + GetFileName(MovieName$)
+    If EXT_PALETTE_ON And (EXT_PALETTE_METHOD > 2) Then
+        SRCPAL$ = " " + PPath$ + ".PAL"
+        For I = 1 To NUMBER_OF_PARTS
+            TrgPAL$ = " " + PPath$ + PartName(I) + ".PAL"
+            CMD$ = CopyCmd$ + SRCPAL$ + TrgPAL$
+            Print CMD$
+            Shell CMD$
+        Next
+    End If
+
+    If Not Interleave_Audio Then
+        SAudFile$ = PPath$ + ".SVA"
+        OpenAudioFile SAudFile$
+        For I = 1 To NUMBER_OF_PARTS
+            Open PPath$ + PartName(I) + ".SPV" For Binary As MainLFN
+            Get MainLFN, , PartHEADER
+            Close MainLFN
+            Fr_Count = PartHEADER.NumFrames
+            OutAudFile$ = PPath$ + PartName(I) + ".SVA"
+            Print "WRITING: "; GetFileName(OutAudFile$) + ".SVA"
+            Print
+            If _FileExists(OutAudFile$) Then Kill OutAudFile$
+            Open OutAudFile$ For Binary As 5
+            For J = 1 To Fr_Count
+                GetAudioFrame
+                Put #5, , AudioBuffer()
+            Next
+            Close 5
+        Next
+        Close AudioLFN
+        Kill SAudFile$
+    End If
+    MM_DestScr
+End Sub
+
+Function PartName$ (PNum As Integer)
+    Dim TmpN$
+
+    TmpN$ = "-PART-"
+    If PNum < 10 Then TmpN$ = TmpN$ + "0"
+    PartName$ = TmpN$ + _Trim$(Str$(PNum))
+
+End Function
+
+Sub PROCESS_THE_FRAMES (StartFrame As Long, EndFrame As Long)
+
+    Dim I As Long
+    Dim Y As Long
+    Dim X As Long
+    Dim Z As Long
+    Dim SUFFIX$, DOFILE$
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    Select Case StartFrame
+        Case 1 To 9
+            SUFFIX$ = "0000000"
+        Case 10 To 99
+            SUFFIX$ = "000000"
+        Case 100 To 999
+            SUFFIX$ = "00000"
+        Case 1000 To 9999
+            SUFFIX$ = "0000"
+        Case 10000 To 99999
+            SUFFIX$ = "000"
+        Case 100000 To 999999
+            SUFFIX$ = "00"
+        Case Is > 999999
+            SUFFIX$ = "0"
+    End Select
+
+    CURRENT_PART_FRAME = 1
+
+    ' FAST loading ONLY runs through the pipeline, using the MMFASTFRAME
+    ' helper program (even with 1 thread).  There is no other way to do it.
+    PIPE_FAST = _FALSE
+    FAST_HELPER$ = ""
+    If USE_QB64FASTMODE And (Not DO_JPG) And (Not CX16_IMG_MODE) Then
+        FAST_HELPER$ = FAST_HELPER_PATH$
+        If FAST_HELPER$ = "" Then
+            ErrorHalt "FAST loading needs the helper program MMFASTFRAME" + CRLF + "in the same folder as this program." + CRLF + CRLF + "Looked in: " + MY_INSTALL_DIR$
+        End If
+        PIPE_FAST = _TRUE
+    End If
+    PIPE_ON = (Not DO_JPG) And ((MAGICK_PARALLEL > 1) Or PIPE_FAST)
+    PIPE_FIRST = StartFrame
+    PIPE_ANY_OK = _FALSE
+    PIPE_NEXT = StartFrame
+    PIPE_END = EndFrame
+    ' the image pre-filter: inside the background jobs when the pipeline is on, else a pre-filter only pipeline
+    PF_ON = RUN_PRE_FILTER And (Not PIPE_ON)
+    PF_FIRST = StartFrame
+    PF_NEXT = StartFrame
+    PF_END = EndFrame
+
+    I& = StartFrame
+    Do
+        'For I& = StartFrame To EndFrame
+        If I& = 10 Then SUFFIX$ = "000000"
+        If I& = 100 Then SUFFIX$ = "00000"
+        If I& = 1000 Then SUFFIX$ = "0000"
+        If I& = 10000 Then SUFFIX$ = "000"
+        If I& = 100000 Then SUFFIX$ = "00"
+        If I& = 1000000 Then SUFFIX$ = "0"
+
+
+        MM_DestScr
+        Percentage = (I& / FrameCount) * 100
+
+        DOFILE$ = SUFFIX$ + Mid$(Str$(I&), 2) + FrameExt$
+
+        If PF_ON Then PF_WAIT I&
+
+        If DO_JPG Then
+            WRITE_JPEG_FRAME DOFILE$
+            GoTo NEXTFRAME
+        End If
+
+        PIPE_CUR = I&
+        Load_Image DOFILE$
+
+
+        If Bit_Map_Mode And X_BITS < 8 Then
+            If X_BITS = 1 And X_PALMODE = CUST_1BPP Then
+                UseCustom1BPP
+            End If
+            If X_BITS = 1 And X_PALMODE = BW_MODE Then
+                ForceBW
+            End If
+            If X_PALMODE = GREEN_MODE Then InjectGreenPal: COUNT_IMAGE_COLORS
+            If X_PALMODE = AMBER_MODE Then InjectAmberPal: COUNT_IMAGE_COLORS
+        Else
+            If Make4BPP_VIDEO And DoGreen Then InjectGreenPal: COUNT_IMAGE_COLORS
+            If Make4BPP_VIDEO And DoAmber Then InjectAmberPal: COUNT_IMAGE_COLORS
+        End If
+
+        If EXT_PALETTE_ON Then
+            IMAGEDATA_MAP_PALETTE
+            COUNT_IMAGE_COLORS
+        End If
+
+        If VGA_16C And VGA16_BARS Then VGA16_ShiftUp
+
+        If FOR_VGA Or VIDEO_IS_PREPADDED Or FOR_AMIGA GoTo SKIP_TALLSTUFF
+
+        If Src_Aspect < 1 And Bit_Map_Mode _AndAlso (Not IS_DESKTOP_ONLY) Then
+            If K_TYPE Then
+                DO_TALL_RESIZE
+            Else
+                DO_TALL_PAD
+            End If
+        End If
+
+        SKIP_TALLSTUFF:
+
+
+        If Bit_Map_Mode Then
+            WRITE_BitMap_Frame_AndPalette
+            GoTo NEXTFRAME
+        Else
+            For Y = 0 To (ImageHeight - SprHeight) Step SprHeight
+                For X = 0 To (ImageWidth - SprWidth) Step SprWidth
+                    GetSprite X, Y
+                    If Make4BPP_VIDEO Then
+                        Make4bitSprite
+                        Put MainLFN, , Sprite4BPP()
+                    Else
+                        Put MainLFN, , Sprite()
+                    End If
+                Next
+            Next
+        End If
+
+        If Use_EMBEDDED_FramePalette Then
+            If Make4BPP_VIDEO Then
+                Grab4BitPalette
+                If MAKE_SECTOR_VIDEO Then
+                    PutFullSectorPalette
+                Else
+                    Put MainLFN, , VERAPAL4BPP()
+                End If
+            Else
+                Put MainLFN, , VERAPAL()
+            End If
+
+        End If
+
+        NEXTFRAME:
+        If WantsPreview Then Showit Else MM_Progress
+        If MM_SNAPREQ Then
+            MM_SNAPREQ = _FALSE
+            If WantsPreview Then SAVESAMPLEBIN I&, DOFILE$
+        End If
+
+        ' If Wipe_TMP_Files Then Kill DOFILE$
+        CURRENT_PART_FRAME = CURRENT_PART_FRAME + 1
+
+        If (I& < FrameCount) And Interleave_Audio Then
+            If MAKE_SILENT_VIDEO Then
+                Put MainLFN, , BlankAudioBuffer()
+            Else
+                GetAudioFrame
+                Put MainLFN, , AudioBuffer()
+            End If
+        End If
+
+        ExitSignal = 0
+        If MM_CANCEL Then ExitSignal = 1: MM_CANCEL = _FALSE
+        If ExitSignal > 0 Then
+            MouseTick_ON
+            If GotYES("CANCEL CONVERSION", "Cancel this conversion ?" + CRLF + CRLF + "The unfinished movie will be removed.", _FALSE) Then
+                If PIPE_ON Then PIPE_CLEANUP
+                PIPE_ON = _FALSE
+                If PF_ON Then PF_CLEANUP
+                ' Windows will not delete a file that is still open, so close the
+                ' movie and audio files first (Kill gave error 75 on Windows).
+                Close MainLFN
+                Close AudioLFN
+                Close 3
+                ChDir ".."
+                SAFE_KILL CURRENT_OUTSPV$
+                Dim TMP_AF$
+                TMP_AF$ = GetFilePath$(CURRENT_OUTSPV$) + GetFileName$(CURRENT_OUTSPV$) + ".SVA"
+                SAFE_KILL TMP_AF$
+                If Wipe_TMP_Files Then
+                    If _DirExists("frames") Then
+                        DIALOG_THEME.MSG_BG = _RGB32(125, 0, 0)
+                        DIALOG_THEME.MSG_FG = _RGB32(50, 255, 0)
+                        If GotYES("REMOVE FRAMES", "Remove the extracted Frames ?", _TRUE) Then
+                            Shell NukeDir$ + "frames"
+                            SAFE_KILL "audio.out"
+                        End If
+                        DIALOG_THEME.MSG_BG = _RGB32(0, 0, 110)
+                        DIALOG_THEME.MSG_FG = _RGB32(255, 255, 255)
+                        TMP_AF$ = BARE_CWD$
+                        ChDir ".."
+                        Shell _Hide "rmdir " + Chr$(34) + TMP_AF$ + Chr$(34) + " 2>" + NULL$
+                    End If
+                End If
+                EXIT_MOVIEMAKER
+            End If
+            MouseTick_OFF
+        End If
+
+        'Next
+        I& = I& + 1
+    Loop Until I& > EndFrame
+    If PIPE_ON Then PIPE_CLEANUP
+    PIPE_ON = _FALSE
+    If PF_ON Then PF_CLEANUP
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub GET_TOTALSIZE
+    ' _Title "X16 Movie Maker - Starting Conversion"
+    ' Dim Shared MOVIE_TOTAL_FRAMES As _Integer64
+    ' Dim Shared SPV_TOTAL_SIZE As _Unsigned _Integer64
+    ' Dim Shared CURRENT_SEGMENT_SIZE As _Unsigned Long
+    ' Dim Shared FRAME_TOTAL_SIZE As _Unsigned _Integer64
+    ' Dim Shared AUDIO_TOTAL_SIZE As _Unsigned _Integer64
+    ' Dim Shared TOTAL_PALETTE_SIZE As _Unsigned Long
+    Dim FrameSize As _Integer64
+    Dim PSize As _Integer64
+    Dim BitDiv As _Integer64
+
+    If FOR_AMIGA Then
+        FrameSize = (ImageWidth * ImageHeight) * (X_BITS / 8)
+        Select Case X_BITS
+            Case 4
+                PSize = 32
+            Case 3
+                PSize = 16
+            Case 2
+                PSize = 8
+            Case 1
+                PSize = 4
+        End Select
+        FRAME_TOTAL_SIZE = FrameSize * FrameCount
+        TOTAL_PALETTE_SIZE = PSize * FrameCount
+        GoTo PCMSIZING
+    End If
+
+    If Bit_Map_Mode Then
+        Select Case X_BITS
+            Case 8
+                BitDiv = 1
+                PSize = 512
+            Case 4
+                BitDiv = 2
+                PSize = 32
+            Case 2
+                BitDiv = 4
+                PSize = 8
+            Case 1
+                BitDiv = 8
+                PSize = 4
+        End Select
+    Else
+        If Make4BPP_VIDEO Then
+            BitDiv = 2
+            PSize = 32
+        Else
+            BitDiv = 1
+            PSize = 512
+        End If
+    End If
+
+    If DO_JPG Then
+        FRAME_TOTAL_SIZE = JPG_FRAMETOTALSIZE + (FrameCount * 4)
+        TOTAL_PALETTE_SIZE = 0
+        FrameSize = Int(FRAME_TOTAL_SIZE / FrameCount)
+        GoTo PCMSIZING
+    Else
+        FrameSize = (ImageHeight * ImageWidth) \ BitDiv
+        FRAME_TOTAL_SIZE = FrameSize * FrameCount
+    End If
+
+
+    If MAKE_SECTOR_VIDEO Then PSize = 512
+    If FOR_VGA Or FULL_24BIT_PALETTE Then PSize = 768
+    If VGA_16C Then PSize = 48
+    TOTAL_PALETTE_SIZE = PSize * FrameCount
+
+    PCMSIZING:
+    If FOR_AMIGA Then
+        PCM_BYTERATE = AMIGA_RATE
+    Else
+        PCM_BYTERATE = ((VERA_RATE / 128) * 48828.15)
+    End If
+
+    If ENABLE_16BIT_PCM Then PCM_BYTERATE = PCM_BYTERATE * 2
+    If ENABLE_STEREO_PCM Then PCM_BYTERATE = PCM_BYTERATE * 2
+    REAL_FPS = PCM_BYTERATE / Audio_FrameSize
+    VIDEO_DATA_RATE = (FrameSize + PSize) * REAL_FPS
+    AUDIO_DATA_RATE = Audio_FrameSize * REAL_FPS
+    TOTAL_DATA_RATE = VIDEO_DATA_RATE + AUDIO_DATA_RATE
+
+    If Interleave_Audio Then
+        AUDIO_TOTAL_SIZE = Audio_FrameSize * FrameCount
+        If Audio_FrameSize < 2049 Then
+            AUDIO_TOTAL_SIZE = AUDIO_TOTAL_SIZE + Audio_FrameSize
+        End If
+    Else
+        AUDIO_TOTAL_SIZE = 0
+    End If
+
+    SPV_TOTAL_SIZE = FRAME_TOTAL_SIZE + TOTAL_PALETTE_SIZE + AUDIO_TOTAL_SIZE
+
+    If MAKE_SECTOR_VIDEO Then
+        SPV_TOTAL_SIZE = SPV_TOTAL_SIZE + 512
+    Else
+        SPV_TOTAL_SIZE = SPV_TOTAL_SIZE + 32
+    End If
+
+    If SPV_TOTAL_SIZE < MAX_MOVIE_BYTES Then
+        TARGET_PART_SIZE = SPV_TOTAL_SIZE
+    Else
+        Dim ms$
+
+        TARGET_PART_SIZE = SPV_TOTAL_SIZE
+
+        If MM_Chk(SplitCB) Then
+            ASK_DO_PARTS
+        Else
+            ms$ = "This Movie File is too big for a FAT32 File System !" + CRLF + CRLF
+            ms$ = ms$ + "YES    =  Split it into parts (the Split check box gets ticked)." + CRLF
+            ms$ = ms$ + "NO     =  Make one big Desktop only file (not for a FAT32 SD-Card)." + CRLF
+            ms$ = ms$ + "CANCEL =  Abort and start over with the same source file."
+            MM_FATR = MessageBox(MM_Msg$(ms$), "File Size Warning !", MsgBox_YesNoCancel + MsgBox_Exclamation)
+            Select Case MM_FATR
+                Case MsgBox_Yes
+                    MM_SetChk SplitCB, _TRUE
+                    ASK_DO_PARTS
+                Case MsgBox_No
+                    ASK_DO_PARTS
+                Case Else
+                    ChDir ".."
+                    If GotYES("REMOVE FRAMES", "Remove the extracted Frames ?", _TRUE) Then
+                        Shell NukeDir$ + "frames"
+                        If _FileExists("audio.out") Then Kill "audio.out"
+                    End If
+                    MM_RELAUNCH_FILE$ = MM_SRCFILE$
+                    EXIT_MOVIEMAKER
+            End Select
+        End If
+    End If
+End Sub
+
+Sub OPEN_TARGET_FOLDER
+    Dim TF$
+    Dim POPDIR$
+    TF$ = TARGET_FOLDER$
+    If (Left$(TF$, 1) <> Chr$(34)) And (InStr(TF$, Chr$(32)) > 0) Then
+        TF$ = Chr$(34) + TF$ + Chr$(34)
+    End If
+    $If WINDOWS Then
+        POPDIR$ = _CWD$
+        ChDir TARGET_FOLDER$
+        Shell _DontWait "START ."
+        ChDir POPDIR$
+    $Else
+        Shell _DontWait SystemOpen$ + " " + TF$ + " > " + NULL$ + " 2>&1"
+    $End If
+
+End Sub
+
+Sub WRITE_VideoPaletteFile
+    Dim i As Long
+    Dim PFILENAME$
+    PFILENAME$ = TARGET_FOLDER$ + GetFileName(MovieName$) + ".PAL"
+    If _FileExists(PFILENAME$) Then Kill PFILENAME$
+    Open PFILENAME$ For Binary As #5
+    If Make4BPP_VIDEO Then
+        Dim VP As VPALTYPE
+        For i = 0 To 15
+            VP = VERA_LOADED_PALETTE(i)
+            Put #5, , VP
+        Next
+    Else
+        Put #5, , VERA_LOADED_PALETTE()
+    End If
+    Close #5
+End Sub
+
+Sub OPEN_SourceAudio
+    Dim tmp$
+    Dim MODCheck As Integer
+
+    OpenAudioFile SRC_AUDIOFILE$
+
+    If USE_EXISTING_FRAMEFOLDER Then
+        If GET_FRAME_INFO Then
+            MODCheck = Audio_FrameSize Mod 512
+            If MAKE_SECTOR_VIDEO And (MODCheck > 0) Then
+                If MODCheck < 32 Then
+                    Audio_FrameSize = Audio_FrameSize - MODCheck
+                    ReDim AudioBuffer(0 To Audio_FrameSize - 1) As _Unsigned _Byte
+                    ReDim BlankAudioBuffer(0 To Audio_FrameSize - 1) As _Unsigned _Byte
+                Else
+                    GoTo GOT_PARMS
+                End If
+            End If
+            tmp$ = "A Frames data File was Found !" + CRLF + "Using this DATA."
+            MM_DestScr
+            INFO_DIALOG "FOUND INFO FILE", (tmp$), "info"
+            GoTo GOT_PARMS
+        End If
+        Dim AR
+        AR = Audio_FrameSize * Val(MovieFPS$)
+        If ENABLE_16BIT_PCM Or ENABLE_STEREO_PCM Then
+            AR = AR / 2
+        End If
+        If ENABLE_16BIT_PCM And ENABLE_STEREO_PCM Then
+            AR = AR / 2
+        End If
+        AR = _Round(AR)
+        VERA_RATE = VERA_RATEBYTE(AR)
+    End If
+
+    GOT_PARMS:
+    SUCCESS = _TRUE
+    If MAKE_SECTOR_VIDEO And ((Audio_FrameSize Mod 512) > 0) Then
+        MM_DestScr
+        INFO_DIALOG "AUDIO FILE MISMATCH", SRC_AUDIOFILE$ + " Not suitable for High Bandwidth vid." + CRLF + "Not an even number of sector blocks !" + CRLF + CRLF + "Please Generate this Video from Scratch !", "info"
+        SUCCESS = _FALSE
+    End If
+End Sub
+
+Sub PutFullSectorPalette ()
+    Static T_Pal_Indx As Integer
+    Static L_Pal_Indx As Integer
+    Dim I As Integer
+    Static PalNum As Integer
+    Static ZPal As VPALTYPE
+    Static ZPal1 As VPALTYPE
+    Static LastPal(0 To 15) As VPALTYPE
+
+    If PalNum = 0 Then
+        ZPal.GB = 0
+        ZPal.R = 0
+        PalNum = Val(UsedCols$) - 1
+    End If
+
+    If T_Pal_Indx = &HE0 Then
+        T_Pal_Indx = &HF0 ' VERA Pal Row 15
+        L_Pal_Indx = &HE0
+    Else
+        T_Pal_Indx = &HE0 ' VERA Pal Row 14
+        L_Pal_Indx = &HF0
+    End If
+    If T_Pal_Indx = 0 Then T_Pal_Indx = &HE0
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    I = 0
+    Do
+        WorkingPAL(I + L_Pal_Indx) = LastPal(I)
+        I = I + 1
+    Loop Until I > PalNum
+    I = 0
+    If Bit_Map_Mode Then
+        ZPal = VERAPALX_BPP(0)
+        ZPal1 = VERAPALX_BPP(1)
+        Do
+            WorkingPAL(I + T_Pal_Indx) = VERAPALX_BPP(I)
+            LastPal(I) = VERAPALX_BPP(I)
+            I = I + 1
+        Loop Until I > UBound(VERAPALX_BPP)
+    Else
+        ZPal = VERAPAL4BPP(0)
+        Do
+            WorkingPAL(I + T_Pal_Indx) = VERAPAL4BPP(I)
+            LastPal(I) = VERAPAL4BPP(I)
+            I = I + 1
+        Loop Until I > PalNum
+    End If
+    WorkingPAL(0) = ZPal
+    If X_BITS = 1 Then WorkingPAL(1) = ZPal1
+    Put MainLFN, , WorkingPAL()
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub WRITE_BitMap_Frame_AndPalette
+    ' Dim Shared FOR_VGA As Integer
+    ' Dim Shared VGA_MODEX As Integer
+    ' Dim Shared VGA_13H As Integer
+
+    If FOR_AMIGA Then
+        PutAmiga_PlanarBuffer
+        PUT_AMIGAPALETTE
+        Exit Sub
+    End If
+
+    If VGA_16C Then
+        ' VGA 16 color (VTYPE 88, BPP 4): 4 bit planes written by the Amiga code, then 16 palette entries of 6 bit R,G,B
+        VGA16_CheckPlanes
+        PutAmiga_PlanarBuffer
+        PUT_VGA16PALETTE
+        Exit Sub
+    End If
+
+    If FOR_VGA Or FULL_24BIT_PALETTE Then
+        If VGA_MODEX Then
+            ' QUARTER THE ModeX BITMAP
+            PutModeX_PlanarBuffer
+        Else
+            ' Contiguous 320 x 200 BITMAP
+            Put MainLFN, , ImageData()
+        End If
+        Put MainLFN, , VGA_PALETTE()
+        Exit Sub
+    End If
+
+    If X_BITS < 8 Then
+        If Not CX16_IMG_MODE Then DownSampleImage
+        Put MainLFN, , ImageDataX_BPP()
+    Else
+        Put MainLFN, , ImageData()
+    End If
+
+    PUTPALETTE:
+    If MAKE_SECTOR_VIDEO Then
+        If DoPadFrame Then Put MainLFN, , PadBuffer()
+        If Use_EMBEDDED_FramePalette Then
+            If X_BITS < 8 Then
+                PutFullSectorPalette
+            Else
+                Put MainLFN, , VERAPAL()
+            End If
+        End If
+    Else
+        If Use_EMBEDDED_FramePalette Then
+            If X_BITS < 8 Then
+                Put MainLFN, , VERAPALX_BPP()
+            Else
+                Put MainLFN, , VERAPAL()
+            End If
+        End If
+    End If
+End Sub
+
+Sub DO_TALL_RESIZE
+    Static TImage1 As Long
+    Static TImage2 As Long
+    Static IMem1 As _MEM
+    If TImage2 = 0 Then
+        TImage2 = _NewImage(270, ImageHeight, 256)
+        TImage1 = _NewImage(ImageWidth, ImageHeight, 256)
+        IMem1 = _MemImage(TImage1)
+    End If
+    If USE_QB64FASTMODE Then
+        MakeIndexZero_BLACK
+    End If
+    _MemPut IMem1, IMem1.OFFSET, ImageData()
+    _PutImage , TImage1, TImage2
+    _MemFill IMem1, IMem1.OFFSET, ImageWidth * ImageHeight, 0 As _Unsigned _Byte
+    _PutImage (26, 0), TImage2, TImage1
+    _MemGet IMem1, IMem1.OFFSET, ImageData()
+End Sub
+
+Sub DO_TALL_PAD
+    Dim TImage1 As Long
+    Dim TImage2 As Long
+    Dim IMem1 As _MEM
+    Dim X2 As Long
+    Dim W2 As Long
+    Dim DW As Double
+    If USE_QB64FASTMODE Then
+        MakeIndexZero_BLACK
+    End If
+    DW = ImageWidth
+    W2 = Int(DW * .421875)
+    X2 = (ImageWidth - W2) \ 2
+    TImage1 = _NewImage(ImageWidth, ImageHeight, 256)
+    TImage2 = _NewImage(W2, ImageHeight, 256)
+    IMem1 = _MemImage(TImage1)
+    _MemPut IMem1, IMem1.OFFSET, ImageData()
+    _PutImage , TImage1, TImage2
+    _MemFill IMem1, IMem1.OFFSET, ImageWidth * ImageHeight, 0 As _Unsigned _Byte
+    _PutImage (X2, 0), TImage2, TImage1
+    _MemGet IMem1, IMem1.OFFSET, ImageData()
+    _MemFree IMem1
+    _FreeImage TImage1
+    _FreeImage TImage2
+End Sub
+
+Sub PAD_VIDEO_HEADER ()
+    Dim I As Integer
+    ReDim PadBuffer(0 To 479) As _Unsigned _Byte
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    For I = 0 To 479
+        PadBuffer(I) = Asc("_")
+    Next
+    Put MainLFN, , PadBuffer()
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub KILL_TMP_MAPFILE
+    Dim F$
+    F$ = "cx16palexp.bmp"
+    If _FileExists(F$) Then Kill F$
+End Sub
+
+Sub WriteX16Player ()
+    Dim pfName$
+    Dim b As _Unsigned _Byte
+    Dim I As Integer
+    Dim SeekPos As Long
+
+    If FOR_VGA Then
+        _WriteFile TARGET_FOLDER$ + "PLAYSPV.EXE", _Embedded$("DOSPLAYER")
+        pfName$ = TARGET_FOLDER$ + UCase$(BASENAME$) + ".BAT"
+        I = FreeFile
+        Open pfName$ For Output As I
+        pfName$ = UCase$(BASENAME$) + ".SPV"
+        Print #I, "PLAYSPV " + pfName$
+        Print #I, ""
+        Close I
+        Exit Sub
+    End If
+
+    ' Amiga (VTYPE 199): the Amiga player is written by the helper WRITE_AMPLAYER, if it is in this
+    ' program's folder.  Run hidden, and skipped without a word when the helper is not there.
+    If FOR_AMIGA Then
+        If USE_AMIGA_PLAYER Then
+            Dim ampSPV$
+            ampSPV$ = CURRENT_OUTSPV$
+            If InStr(ampSPV$, Chr$(34)) = 0 Then ampSPV$ = Chr$(34) + ampSPV$ + Chr$(34)
+            Shell _Hide AMIGA_PLAYER_NAME$ + " " + ampSPV$
+        End If
+        Exit Sub
+    End If
+    If IS_DESKTOP_ONLY Then Exit Sub
+    BASENAME$ = UCase$(BASENAME$)
+    pfName$ = TARGET_FOLDER$ + BASENAME$ + ".PRG"
+    ' Write the appropriate
+    ' Commander X16
+    ' binary PRG template.
+    If DO_PART_VIDEO Then
+        _WriteFile pfName$, _Embedded$("partplayer")
+        ' This is the position in the X16 program file
+        ' Where the filename variable value is located
+        SeekPos = &HA5
+    Else
+        ' This is the position in the X16 program file
+        ' Where the filename variable value is located
+        SeekPos = &H2E
+        _WriteFile pfName$, _Embedded$("x16player")
+    End If
+    ' Now seek and change the Video File Name
+    ' variable in the Template
+    Open pfName$ For Binary As #10
+    Seek #10, SeekPos
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    For I = 1 To Len(BASENAME$)
+        b = Asc(Mid$(BASENAME$, I, 1))
+        Put #10, , b
+    Next
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+    b = 0
+    Put #10, , b
+    Close 10
+End Sub
+
+Sub CheckVERAPal ()
+    Dim TMPPAL As VPALTYPE
+    DO_SWAP_1BPP = _FALSE
+    Dim g0 As Integer
+    Dim b0 As Integer
+    Dim g1 As Integer
+    Dim b1 As Integer
+    Dim Level0 As Integer
+    Dim Level1 As Integer
+
+    g0 = Int(VERAPAL(0).GB / 16)
+    b0 = VERAPAL(0).GB And &H0F
+    Level0 = g0 + b0 + VERAPAL(0).R
+
+    g1 = Int(VERAPAL(1).GB / 16)
+    b1 = VERAPAL(1).GB And &H0F
+    Level1 = g1 + b1 + VERAPAL(1).R
+
+    If Level0 > Level1 Then
+        TMPPAL = VERAPAL(0)
+        VERAPAL(0) = VERAPAL(1)
+        VERAPAL(1) = TMPPAL
+        DO_SWAP_1BPP = _TRUE
+    End If
+End Sub
+
+Sub GET_SRC_IMAGESIZE (SourceImageName$)
+    Dim chkheader As BMPHeaderType
+    Dim cmd$, tmp$
+    Dim TEM_PATH$
+    Dim POPD$
+    Dim OUTFILE$
+    Src_Width = 0
+    Src_Height = 0
+    SUCCESS = _FALSE
+
+    If _FileExists(SourceImageName$) Then
+        TEM_PATH$ = GetFilePath(SourceImageName$)
+        POPD$ = _CWD$
+        If (TEM_PATH$ <> "") _AndAlso (TEM_PATH$ <> POPD$) Then
+            ChDir TEM_PATH$
+        End If
+        tmp$ = GetFileName(SourceImageName$) + GetFileExt(SourceImageName$)
+        If InStr(tmp$, Chr$(32)) > 0 Then
+            tmp$ = Chr$(34) + tmp$ + Chr$(34)
+        End If
+        OUTFILE$ = MAKE_UNIQUE_TMP(".bmp")
+        cmd$ = Magick$ + " " + tmp$ + " " + OUTFILE$
+        Shell cmd$
+        If _FileExists(OUTFILE$) Then
+            Open OUTFILE$ For Binary As #1
+            Get #1, , chkheader
+            Close #1
+            Src_Width = chkheader.wid
+            Src_Height = chkheader.hei
+            Src_Aspect = Src_Width / Src_Height
+            Kill OUTFILE$
+            SUCCESS = _TRUE
+        Else
+            _Dest _Console
+            Print
+            Print "MAGICK COMMAND FAILED"
+            Print
+            MM_DestScr
+        End If
+        ChDir POPD$
+    End If
+End Sub
+
+Function MAKE_UNIQUE_TMP$ (EXT$)
+    Dim TMP$
+    Dim FLIP As Integer
+    Dim I As Integer
+    Dim C As _Unsigned _Byte
+    Randomize Timer
+
+    STARTRAND:
+    TMP$ = ""
+    For I = 1 To 10
+        FLIP = Int(Rnd(1) * 30) + 1
+        If FLIP < 11 Then
+            C = Int(Rnd(1) * 10) + 48
+        End If
+        If FLIP > 10 And FLIP < 21 Then
+            C = Int(Rnd(1) * 26) + 97
+        End If
+        If FLIP > 20 Then
+            C = Int(Rnd(1) * 26) + 65
+        End If
+        TMP$ = TMP$ + Chr$(C)
+    Next
+    TMP$ = TMP$ + EXT$
+    If _FileExists(TMP$) Then GoTo STARTRAND
+    MAKE_UNIQUE_TMP$ = TMP$
+End Function
+
+Sub MAKE_BLANK_AUDIOFILE (AFileName$, NumberofBytes As _Unsigned Long)
+    Dim Bytes_Written As _Unsigned Long
+    Dim OUTBUFFER(0 To 65535) As _Unsigned _Byte
+    Dim W As _Unsigned Integer
+
+    If _FileExists(AFileName$) Then Kill AFileName$
+    Open AFileName$ For Binary As #17
+
+    While (NumberofBytes - Bytes_Written) > Len(OUTBUFFER())
+        Put #17, , OUTBUFFER()
+        Bytes_Written = Bytes_Written + Len(OUTBUFFER())
+    Wend
+
+    While Bytes_Written < NumberofBytes
+        Put #17, , W
+        Bytes_Written = Bytes_Written + 2
+    Wend
+    Close 17
+End Sub
+
+Sub OpenAudioFile (AFileName$)
+    Dim DoAdjust As Integer
+    Dim ModCheck As Integer
+    Dim Test1
+    Dim Test2
+    Dim Adjust As Integer
+    Dim FSize As Long
+
+    DoAdjust = _FALSE
+    If ENABLE_16BIT_PCM Or ENABLE_STEREO_PCM Then
+        DoAdjust = _TRUE
+        ModCheck = 2
+    End If
+    If ENABLE_16BIT_PCM And ENABLE_STEREO_PCM Then
+        ModCheck = 4
+    End If
+    START_AUDIO_OPEN:
+    If MAKE_SILENT_VIDEO Then
+        Audio_FrameSize = aframe
+        GoTo DONE_AUD:
+    End If
+
+    If _FileExists(AFileName$) Then
+        Open AFileName$ For Binary As AudioLFN
+        AudioFileSize = LOF(AudioLFN)
+        AudioByteCount = AudioFileSize
+
+        If MAKE_SECTOR_VIDEO Then
+            Audio_FrameSize = aframe
+        Else
+            Test1 = AudioFileSize / FrameCount
+            Test2 = _Round(Test1)
+            FSize = Test2
+            If DoAdjust Then
+                If Test2 < Test1 Then Adjust = 1
+                If Test2 > Test1 Then Adjust = -1
+                If Adjust = 0 Then Adjust = 1
+                If Test2 Mod ModCheck > 0 Then
+                    Do While (FSize Mod ModCheck) > 0
+                        FSize = FSize + Adjust
+                    Loop
+                End If
+            End If
+            Audio_FrameSize = FSize
+        End If
+    Else
+        _SndPlay ERROR_BEEP
+        MAKE_SILENT_VIDEO = GotYES("AUDIO FILE ERROR", AFileName$ + " NOT FOUND !" + CRLF + CRLF + "Make a Silent Video ?", _TRUE)
+        If MAKE_SILENT_VIDEO GoTo START_AUDIO_OPEN
+        EXIT_MOVIEMAKER
+    End If
+    DONE_AUD:
+    AudIndxLimit = Audio_FrameSize - 1
+    ReDim AudioBuffer(0 To AudIndxLimit)
+    ReDim BlankAudioBuffer(0 To AudIndxLimit)
+
+End Sub
+
+Sub ZeroAudioBuffer
+    Dim I As Long
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    For I = 0 To AudIndxLimit
+        AudioBuffer(I) = 0
+    Next
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+End Sub
+
+Sub GetAudioFrame
+    Static NoMoreAudio
+
+    If NoMoreAudio Then Exit Sub
+    If AudioByteCount >= Audio_FrameSize Then
+        Get AudioLFN, , AudioBuffer()
+        AudioByteCount = AudioByteCount - Audio_FrameSize
+    Else
+        ZeroAudioBuffer
+        If AudioByteCount > 0 Then
+            Get AudioLFN, , AudioBuffer()
+            AudioByteCount = 0
+        Else
+            NoMoreAudio = _TRUE
+            Close AudioLFN
+        End If
+    End If
+End Sub
+
+Sub ShowAudioInterleave
+    Color _RGB(255, 195, 0)
+    Print " TOGGLE Audio Track: ";
+    If Interleave_Audio Then
+        Color _RGB(255, 255, 255), _RGB(250, 0, 0)
+        Print " Embedded ";
+    Else
+        Color _RGB(155, 155, 155), _RGB(250, 0, 0)
+        Tprint "{WHT}.SVA {GRAY 1}file "
+    End If
+    Color _RGB(155, 155, 155), _RGB(0, 0, 180)
+End Sub
+
+Sub ShowAudioFormat
+    Color _RGB(155, 155, 155), _RGB(0, 0, 180)
+    Print "Audio Format:   ";
+    If AUDIO_EXTENTIONS_ON Then
+        Color _RGB(255, 255, 255), _RGB(250, 0, 0)
+    Else
+        Color _RGB(155, 155, 155), _RGB(250, 0, 0)
+    End If
+
+    If ENABLE_16BIT_PCM Then
+        Print " 16 bit";
+    Else
+        Print "  8 bit";
+    End If
+
+    If ENABLE_STEREO_PCM Then
+        Print " stereo";
+    Else
+        Print " mono  ";
+    End If
+    Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+End Sub
+
+Sub ShowAudioFormat2
+    Dim X As Integer
+    Dim Y As Integer
+    X = Pos(0)
+    Y = CsrLin + 1
+    Color _RGB(155, 155, 155), _RGB(0, 0, 180)
+    Tprint "{GRAY 1}Audio {WHT}PCM{GRAY 1} Format "
+
+    Locate Y, X
+    If AUDIO_EXTENTIONS_ON Then
+        Color _RGB(255, 255, 255), _RGB(250, 0, 0)
+    Else
+        Color _RGB(155, 155, 155), _RGB(250, 0, 0)
+    End If
+
+    If ENABLE_16BIT_PCM Then
+        Print " 16 bit";
+    Else
+        Print "  8 bit";
+    End If
+
+    If ENABLE_STEREO_PCM Then
+        Print " stereo ";
+    Else
+        Print " mono   ";
+    End If
+    Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+End Sub
+
+Sub TURNOFF_AUDIO_EXTENSIONS
+    AUDIO_EXTENTIONS_ON = _FALSE
+    ENABLE_16BIT_PCM = _FALSE
+    ENABLE_STEREO_PCM = _FALSE
+End Sub
+
+Sub CheckProjectSubDirs
+    Dim SVids$
+    Dim BVids$
+    Dim HiVids$
+    Dim PopDir$
+    Dim ChkD$
+
+    SVids$ = "SPRITEVIDS" + Slash$
+    BVids$ = "BITMAP" + Slash$
+    HiVids$ = "SECTORALIGNED" + Slash$
+    PopDir$ = _CWD$
+    ChDir ProjectHome$
+    ChkD$ = "SPRITEVIDS"
+    GoSub ChkIt
+    ChkD$ = SVids$ + "GRAYSCALE"
+    GoSub ChkIt
+    ChkD$ = SVids$ + "4BPP"
+    GoSub ChkIt
+    ChkD$ = SVids$ + "8BPP"
+    GoSub ChkIt
+    ChkD$ = "BITMAP"
+    GoSub ChkIt
+    ChkD$ = BVids$ + "1BPP"
+    GoSub ChkIt
+    ChkD$ = BVids$ + "2BPP"
+    GoSub ChkIt
+    ChkD$ = BVids$ + "4BPP"
+    GoSub ChkIt
+    ChkD$ = BVids$ + "8BPP"
+    GoSub ChkIt
+
+
+    ChkD$ = "SECTORALIGNED"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + "BITMAP"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + BVids$ + "1BPP"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + BVids$ + "2BPP"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + BVids$ + "4BPP"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + BVids$ + "8BPP"
+    GoSub ChkIt
+
+    ChkD$ = HiVids$ + "SPRITEVIDS"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + SVids$ + "GRAYSCALE"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + SVids$ + "4BPP"
+    GoSub ChkIt
+    ChkD$ = HiVids$ + SVids$ + "8BPP"
+    GoSub ChkIt
+    ChDir PopDir$
+    Exit Sub
+    ChkIt:
+    If _DirExists(ChkD$) Then
+    Else
+        MkDir ChkD$
+    End If
+    Return
+
+End Sub
+
+Sub FFMpeg_ExtractFrames (ExtractAudioOnly As Integer)
+    Dim AR As Double
+    Dim I As Long
+    Dim W As Long
+    Dim H As Long
+    Dim SY As Long
+    Dim xPos As Long
+    Dim byteRateAdj%
+    Dim MovieSeconds As Double
+    Dim alength As _Unsigned Long
+    Dim msg$, CMD$, Crop_filt$, defaultsr$, AMSG$, AudioRate$
+    Dim AudioCodec$, AOutfile$, F_Filter$
+
+    SetMyScreen 840, 600
+    MM_FFSCR = _TRUE
+    PROG_HEADER "X16 Movie Maker - FFMPEG Processing"
+
+    DName$ = GetFileName(TName$) + GetFileExt(TName$)
+    If InStr(1, TName$, Chr$(32)) > 0 Then
+        TName$ = Chr$(34) + TName$ + Chr$(34)
+    End If
+    If ExtractAudioOnly Then GoTo ExtractAudio
+    CMD$ = "ffmpeg  -i " + TName$
+
+
+    If EXT_PALETTE_ON And EXT_PALETTE_METHOD > 2 Then
+        msg$ = "For Fixed (non VERA) Palette an ffmpeg preprocessing" + CRLF
+        msg$ = msg$ + "pass can be made, to smooth colors.  This does take time!" + CRLF + CRLF
+        msg$ = msg$ + " DO THIS ? "
+        If Not MM_FFCOLOR GoTo SKIP_OVER_FFCOLORS
+        MAKE_FFMPEG_FIXED
+        PROG_HEADER "X16 Movie Maker - FFMPEG Processing"
+        CMD$ = "ffmpeg -i outredcolor.mp4 "
+    End If
+
+    SKIP_OVER_FFCOLORS:
+    If FOR_VGA Then
+        ' Effective aspect: "Crop ultra wide to 16:9" (CROP_VIDEO = 3) makes the picture 16:9 first
+        Dim VAsp As Double
+        VAsp = Src_Aspect
+        If CROP_VIDEO = 3 Then VAsp = 16 / 9
+        If (VAsp > 1.40) And (CROP_VIDEO = 0 Or CROP_VIDEO = 3) Then
+            VideoHeader.HINT = "W"
+            Dim OldHeight As Integer
+            OldHeight = ImageHeight
+            ImageHeight = _Round(320 / VAsp)
+            If OldHeight = 200 Then
+                ImageHeight = _Round(ImageHeight * (200 / 240))
+            End If
+            VideoHeader.FrameHeight = ImageHeight
+            WIDE_DISPLAY = _TRUE
+            If VGA_16C Then
+                ' 15 colors + a black index 0 for the bars (VGA16_ShiftUp), no VERA style palette shifting
+                UsedCols$ = "15"
+                VGA16_BARS = _TRUE
+            Else
+                If Val(UsedCols$) = 256 Then UsedCols$ = "255"
+                PALETTE_SHIFTING_ENABLED = _TRUE
+            End If
+            ReDim ImageData(0 To ((ImageHeight * ImageWidth) - 1)) As _Unsigned _Byte
+        End If
+        If Src_Aspect < 1.3 Then
+            CROP_VIDEO = 4
+        End If
+    End If
+
+
+    If CROP_VIDEO > 0 Then
+
+        Crop_filt$ = " -vf "
+        Select Case CROP_VIDEO
+            Case 1
+                Crop_filt$ = Crop_filt$ + Chr$(34) + "crop="
+                W = Int((Src_Height / 3) * 4)
+                xPos = Int((Src_Width - W) / 2)
+                Crop_filt$ = Crop_filt$ + _Trim$(Str$(W)) + ":" + _Trim$(Str$(Src_Height)) + ":" + _Trim$(Str$(xPos)) + ":0" + Chr$(34) + Chr$(32)
+            Case 2
+                Crop_filt$ = Crop_filt$ + "pad="
+                H = _Round((Src_Width / 4) * 3)
+                SY = Int((H - Src_Height) / 2)
+                Crop_filt$ = Crop_filt$ + _Trim$(Str$(Src_Width)) + ":" + _Trim$(Str$(H)) + ":" + "0:" + _Trim$(Str$(SY)) + Chr$(32)
+            Case 3
+                Crop_filt$ = Crop_filt$ + Chr$(34) + "crop="
+                W = Int((Src_Height / 9) * 16)
+                xPos = Int((Src_Width - W) / 2)
+                Crop_filt$ = Crop_filt$ + _Trim$(Str$(W)) + ":" + _Trim$(Str$(Src_Height)) + ":" + _Trim$(Str$(xPos)) + ":0" + Chr$(34) + Chr$(32)
+            Case 4
+                Crop_filt$ = Crop_filt$ + Chr$(34) + "pad="
+                W = Int((Src_Height / 3) * 4)
+                xPos = Int((W - Src_Width) / 2)
+                Crop_filt$ = Crop_filt$ + _Trim$(Str$(W)) + ":" + _Trim$(Str$(Src_Height)) + ":" + _Trim$(Str$(xPos)) + ":0" + Chr$(34) + Chr$(32)
+            Case 5
+                ' portrait for the K type: pad with black to exactly 9:16 (even sizes), the picture is never stretched
+                Crop_filt$ = Crop_filt$ + Chr$(34) + "pad="
+                If Src_Width * 16 >= Src_Height * 9 Then
+                    W = Src_Width
+                    H = ((Int((Src_Width * 16) / 9 + .999) + 1) \ 2) * 2
+                    xPos = 0
+                    SY = (H - Src_Height) \ 2
+                Else
+                    H = Src_Height
+                    W = ((Int((Src_Height * 9) / 16 + .999) + 1) \ 2) * 2
+                    xPos = (W - Src_Width) \ 2
+                    SY = 0
+                End If
+                Crop_filt$ = Crop_filt$ + _Trim$(Str$(W)) + ":" + _Trim$(Str$(H)) + ":" + _Trim$(Str$(xPos)) + ":" + _Trim$(Str$(SY)) + ":black" + Chr$(34) + Chr$(32)
+        End Select
+        CMD$ = CMD$ + Crop_filt$ + " out.mp4"
+        _Dest _Console
+        Color _RGB(255, 255, 255)
+        DualPrint " "
+        Select Case CROP_VIDEO
+            Case 1
+                AMSG$ = " CROPPING THE VIDEO"
+            Case 2
+                AMSG$ = " LETTER BOXING THE VIDEO"
+            Case 3
+                AMSG$ = "CROPPING ULTRA WIDE TO 16:9 WIDE"
+            Case 4
+                AMSG$ = "PADDING TALL VIDEO"
+            Case 5
+                AMSG$ = "PADDING PORTRAIT VIDEO TO 9:16"
+        End Select
+        DualPrint AMSG$
+        _Dest _Console
+        Print " This may take many minutes on Long Videos !     PLEASE WAIT. "
+        MM_DestScr
+        Tprint " {RED}({WHT}This may take many minutes on Long videos{LIGHT GREEN} !{RED})   {WHT}PLEASE WAIT."
+        If _FileExists("out.mp4") Then Kill "out.mp4"
+
+        MM_DestScr
+        ' Print
+        ' Print Chr$(13); "  ";
+        ' Shell _DontWait CMD$
+        ' MonitorFileSize "out.mp4", 10
+        RUN_FFMPEG CMD$, AMSG$, _TRUE
+        PROG_HEADER "X16 Movie Maker - FFMPEG Processing"
+        CMD$ = "ffmpeg -i out.mp4"
+    End If
+    TRUE_FPS = (_Round(Val(MovieFPS$) * 100)) / 100
+
+    F_Filter$ = " -vf " + Chr$(34) + "fps=" + MovieFPS$ + "/1"
+    If Wipe_TMP_Files Or DO_JPG Then
+        F_Filter$ = F_Filter$ + ", scale=" + _Trim$(Str$(ImageWidth)) + ":" + _Trim$(Str$(ImageHeight))
+    Else
+        If Src_Width > 640 Then
+            F_Filter$ = F_Filter$ + ", scale=640:-1"
+        End If
+    End If
+    Dim iext$, ifmt$
+    iext$ = ".png"
+
+    F_Filter$ = F_Filter$ + Chr$(34)
+    If DO_JPG Then
+        If DO_WEBP Then
+            ' WebP frames in place of JPEG frames (the player decodes them the same way)
+            F_Filter$ = F_Filter$ + " -c:v libwebp -quality " + WEBP_QUAL$ + " -f image2"
+            iext$ = ".webp"
+        Else
+            F_Filter$ = F_Filter$ + " -q:v " + JPG_QUAL$
+            iext$ = ".jpg"
+        End If
+    End If
+
+    ' CMD$ = CMD$ + F_Filter$ + " -c:v " + ifmt$ + " frames/%08d" + iext$
+    ' CMD$ = CMD$ + F_Filter$ + " -c:v frames/%08d" + iext$
+    CMD$ = CMD$ + F_Filter$ + " frames/%08d" + iext$
+
+    _Dest _Console
+    Color 15
+    Cls
+    Print
+    Print "EXTRACTING FRAMES": Print
+    MM_DestScr
+    PROG_HEADER "X16 Movie Maker - FFMPEG Processing"
+    Locate 10, 20
+    Print " EXTRACTING FRAMES"
+    MM_Delay .75
+    RUN_FFMPEG CMD$, "EXTRACTING FRAMES", _TRUE
+    PROG_HEADER "X16 Movie Maker - FFMPEG Processing"
+    Dim POPD$
+    POPD$ = _CWD$
+    ChDir "frames"
+    CountFrames iext$
+    ChDir POPD$
+    ' MonitorFrames ".png"
+    ExtractAudio:
+    PROG_HEADER "X16 Movie Maker - FFMPEG Processing"
+    MM_DestScr
+    Locate 10, 20
+    Color _RGB(255, 195, 0)
+    DualPrint " PREPARING TO EXTRACT AUDIO"
+    MM_Delay .75
+    If FOR_AMIGA Then
+        AR = Make_AmigaAudio
+        Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+        Cls
+        ShowLogo
+        Locate 10, 1
+        GoTo DoExtractAudio
+    End If
+
+    If MAKE_SECTOR_VIDEO Then
+        AR = Make_SectorAligned_AUDIO
+        Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+        Cls
+        ShowLogo
+        Locate 10, 1
+        TweakAudioParms
+        GoTo DoExtractAudio
+    End If
+
+    If IS_DESKTOP_ONLY Then
+        defaultsr$ = "48000"
+    Else
+        defaultsr$ = "16044"
+    End If
+
+    dorateagain:
+    VideoHeader.XAUD_FLAG = " "
+    VideoHeader.XAUD_BYTE = 0
+
+    byteRateAdj% = 1
+    AMSG$ = "Enter Desired Sample Rate." + CRLF + CRLF
+
+    If ENABLE_16BIT_PCM Then
+        AMSG$ = AMSG$ + "(16 bit, "
+        byteRateAdj% = byteRateAdj% * 2
+    Else
+        AMSG$ = AMSG$ + "( 8 bit, "
+    End If
+    If ENABLE_STEREO_PCM Then
+        AMSG$ = AMSG$ + "stereo PCM)"
+        byteRateAdj% = byteRateAdj% * 2
+    Else
+        AMSG$ = AMSG$ + "mono PCM)"
+    End If
+
+    AudioRate$ = MM_AUDIORATE$
+    AudioRate$ = _Trim$(AudioRate$)
+
+
+    If AudioRate$ = "" Then MM_ABORT_REQ = _TRUE: Exit Sub
+
+    ' _MessageBox " DEBUG INFO ", " FRAMECOUNT: " + Str$(FrameCount) + CRLF + " AUDIO RATE: " + AudioRate$
+
+    If IsNum(AudioRate$) Then
+        AR = Val(AudioRate$)
+        AR = _Round(AR * 100) / 100
+        If AR < 6000 Or AR > 48828 Then GoSub rateerror: MM_ABORT_REQ = _TRUE: Exit Sub
+        MovieSeconds = FrameCount / Val(MovieFPS$)
+        alength = AR * MovieSeconds * byteRateAdj%
+        aframe = _Round(alength / FrameCount)
+
+        TweakAudioParms
+        Dim MAX_AUDIO_CHK As Long
+        MAX_AUDIO_CHK = 3072
+
+        If IS_DESKTOP_ONLY Then
+            MAX_AUDIO_CHK = 16384
+        End If
+
+        If aframe > MAX_AUDIO_CHK Then
+            msg$ = "Audio Frame to large,  must be no more than " + _Trim$(Str$(MAX_AUDIO_CHK)) + " bytes." + CRLF + "Current is: " + Str$(aframe)
+            INFO_DIALOG "AUDIO TO LARGE", msg$, "WARNING"
+            MM_ABORT_REQ = _TRUE: Exit Sub
+        End If
+    Else
+        GoSub rateerror
+        MM_ABORT_REQ = _TRUE: Exit Sub
+    End If
+
+    DoExtractAudio:
+    AudioRate$ = Str$(AR)
+    VERA_RATE = VERA_RATEBYTE(AR)
+
+    MM_DestScr
+    _Font Myfont&
+    MM_ConvText "Adjusted audio rate: " + _Trim$(AudioRate$) + " hz" + CHR$(10) + "Audio frame: " + _Trim$(Str$(aframe)) + " bytes."
+
+    If ENABLE_16BIT_PCM Then
+        AudioCodec$ = " -f s16le -acodec pcm_s16le "
+    Else
+        AudioCodec$ = " -f s8 -acodec pcm_s8 "
+    End If
+
+    If FOR_VGA Then
+        AudioCodec$ = " -f u8 -acodec pcm_u8 "
+    End If
+
+    If ENABLE_STEREO_PCM And (Not FOR_VGA) Then
+        AudioCodec$ = AudioCodec$ + " -ac 2 "
+    Else
+        AudioCodec$ = AudioCodec$ + " -ac 1 "
+    End If
+
+    AOutfile$ = " audio.out"
+    If ExtractAudioOnly Then AOutfile$ = " .." + Slash$ + "audio.out"
+
+    CMD$ = "ffmpeg -i " + TName$ + AudioCodec$ + "-ar " + AudioRate$ + AOutfile$
+
+    AOutfile$ = _Trim$(AOutfile$)
+    If _FileExists(AOutfile$) Then Kill AOutfile$
+    RUN_FFMPEG CMD$, "EXTRACTING AUDIO", _FALSE
+    If FFMPEG_ERROR Then
+        msg$ = "PCM Audio could not be extracted." + CRLF + CRLF
+        msg$ = msg$ + "You can still continue with " + CRLF
+        msg$ = msg$ + "a Silent Sound Track !" + CRLF + CRLF
+        msg$ = msg$ + "Do you want to do this ?"
+        MAKE_SILENT_VIDEO = GotYES("AUDIO ERROR", msg$, _TRUE)
+        If Not MAKE_SILENT_VIDEO Then EXIT_MOVIEMAKER
+    End If
+    MM_DestScr
+    Cls
+    Exit Sub
+    rateerror:
+    INFO_DIALOG "INPUT ERROR", "Audio Rate must be between 5000 & 48828 !" + CRLF + "TRY AGAIN", "ERROR"
+    Return
+End Sub
+
+Sub MAKE_FFMPEG_FIXED
+    Dim CMD$
+    Dim CFILT$
+    Dim IF$
+    Dim OF$
+    If _FileExists("outredcolor.mp4") Then Kill "outredcolor.mp4"
+    OF$ = "outredcolor.mp4"
+    IF$ = TName$
+    If InStr(Chr$(32), IF$) > 0 Then
+        IF$ = Chr$(34) + IF$ + Chr$(34)
+    End If
+    '    CFILT$ = " -filter_complex " + Chr$(34) + "[0:v]scale=320:-1,fps=15,lutrgb=r=trunc(val*16/255)*255/15:g=trunc(val*16/255)*255/15:b=trunc(val*16/255)*255/15,split[a][b];[a]palettegen=max_colors=16[p];[b][p]paletteuse=dither=sierra2_4a" + Chr$(34)
+    CFILT$ = " -filter_complex " + Chr$(34) + "lutrgb=r=trunc(val*16/255)*255/15:g=trunc(val*16/255)*255/15:b=trunc(val*16/255)*255/15,split[a][b];[a]palettegen=max_colors=" + _Trim$(UsedCols$) + "[p];[b][p]paletteuse=dither=sierra2_4a" + Chr$(34)
+    CFILT$ = CFILT$ + " -loop 0 "
+    CMD$ = "ffmpeg -i " + IF$ + CFILT$ + OF$
+    DualPrint ""
+    DualPrint CMD$
+    MM_DestScr
+    Tprint "{13}  {YEL}REDUCING COLORS {GRN}!{LIGHT RED}......{LIGHT GREEN}PLEASE WAIT {GRN}!{13}"
+    RUN_FFMPEG CMD$, " VIDEO COLOR REDUCTION !", _TRUE
+    ' Shell _DontWait CMD$
+    ' Print Chr$(13); "  ";
+    ' MonitorFileSize OF$, 340
+End Sub
+
+Sub TweakAudioParms
+    VideoHeader.XAUD_FLAG = "0"
+    VideoHeader.XAUD_BYTE = 0
+    If ENABLE_16BIT_PCM Or ENABLE_STEREO_PCM Then
+        VideoHeader.XAUD_FLAG = "X"
+        If ENABLE_16BIT_PCM Then VideoHeader.XAUD_BYTE = VideoHeader.XAUD_BYTE Or VERA_16BIT
+        If ENABLE_STEREO_PCM Then VideoHeader.XAUD_BYTE = VideoHeader.XAUD_BYTE Or VERA_STEREO
+        If aframe Mod 2 > 0 Then aframe = aframe - 1
+    End If
+
+    If ENABLE_16BIT_PCM And ENABLE_STEREO_PCM Then
+        aframe = aframe - 1
+        Do While aframe Mod 4 > 0
+            aframe = aframe + 1
+        Loop
+    End If
+End Sub
+
+Function VPAL_AVERAGE% (PEntry As VPALTYPE)
+    Dim G%, B%
+
+    G% = _ShR(PEntry.GB, 4)
+    B% = PEntry.GB And &H0F
+    VPAL_AVERAGE = (G% + B% + PEntry.R) / 3
+End Function
+
+Function VERA_RATEBYTE% (SampleRate)
+    VERA_RATEBYTE = Int((SampleRate / 48828.15) * 128)
+End Function
+
+Function PADRATE (SampleRate)
+    Dim TMPRATE As Long
+    Dim TMP1 As Long
+    Dim TMP2 As Long
+    TMPRATE = SampleRate
+    TMP1 = VERA_RATEBYTE(TMPRATE)
+    Do
+        TMPRATE = TMPRATE + 2
+        TMP2 = VERA_RATEBYTE(TMPRATE)
+    Loop Until TMP2 > TMP1
+    Do
+        TMPRATE = TMPRATE - 1
+        TMP2 = VERA_RATEBYTE(TMPRATE)
+    Loop Until TMP1 = TMP2
+    If (SampleRate + 30) > TMPRATE Then
+        PADRATE = SampleRate
+    Else
+        PADRATE = TMPRATE - 30
+    End If
+End Function
+
+Sub CheckForFrames (IN_FOLDER$)
+    Dim POPD$
+    Dim Frm1Suff$
+    Dim Ext$
+    Dim cfile$
+    Dim TMP_FOLD_CHANGE As Integer
+
+    SUCCESS = _FALSE
+    POPD$ = _CWD$
+    If POPD$ <> IN_FOLDER$ Then
+        If _DirExists(IN_FOLDER$) Then
+            ChDir IN_FOLDER$
+            TMP_FOLD_CHANGE = _TRUE
+        Else
+            Exit Sub
+        End If
+    End If
+    MM_Title "X16 Movie Maker - SEARCHING FOR FRAME FILES"
+    Frm1Suff$ = "00000001"
+
+    Ext$ = ".png"
+    GoSub CHECK_FIRST_FRAME
+    If SUCCESS GoTo getCount
+
+    Ext$ = ".bmp"
+    GoSub CHECK_FIRST_FRAME
+    If SUCCESS GoTo getCount
+
+    Ext$ = ".jpg"
+    GoSub CHECK_FIRST_FRAME
+    If SUCCESS GoTo getCount
+
+    Ext$ = ".jpeg"
+    GoSub CHECK_FIRST_FRAME
+    If SUCCESS GoTo getCount
+
+    Ext$ = ".webp"
+    GoSub CHECK_FIRST_FRAME
+    If SUCCESS GoTo getCount
+
+    FrameCount = 0
+    FrameExt$ = "NOT FOUND"
+    SUCCESS = _FALSE
+    GoTo DONE_CHK_FRMS
+
+    getCount:
+    CountFrames Ext$
+    If FrameCount > 0 Then
+        FrameExt$ = Ext$
+        SUCCESS = _TRUE
+        FIRST_FRAME$ = _CWD$ + cfile$
+    Else
+        SUCCESS = _FALSE
+    End If
+
+    DONE_CHK_FRMS:
+    If TMP_FOLD_CHANGE Then ChDir POPD$
+    Exit Sub
+
+    CHECK_FIRST_FRAME:
+    cfile$ = Frm1Suff$ + Ext$
+    SUCCESS = _FileExists(cfile$)
+    If SUCCESS Then
+        Return
+    Else
+        Ext$ = UCase$(Ext$)
+    End If
+    cfile$ = Frm1Suff$ + Ext$
+    SUCCESS = _FileExists(cfile$)
+    Return
+
+End Sub
+
+Sub DIM_SPRITES
+    ReDim Sprite(0 To (((SprWidth * SprHeight)) - 1)) As _Unsigned _Byte
+    If Make4BPP_VIDEO Then ReDim Sprite4BPP(0 To (((SprWidth * SprHeight) / 2) - 1)) As _Unsigned _Byte
+End Sub
+
+Sub SAVESAMPLEBIN (SCOUNT As _Unsigned Long, SRC_FRAME$)
+    Dim F$, FP$, F2$, P$, BM$, BM2$
+
+    F$ = TARGET_FOLDER$ + "FRAME" + _Trim$(Str$(SCOUNT)) + ".bin"
+    FP$ = F$ + ".PAL"
+    F2$ = TARGET_FOLDER$ + "FRAMEX" + _Trim$(Str$(SCOUNT)) + ".bin"
+    P$ = F2$ + ".PAL"
+    BM$ = TARGET_FOLDER$ + "FRAME" + _Trim$(Str$(SCOUNT)) + ".BMP"
+    BM2$ = TARGET_FOLDER$ + "FRM_PAL" + _Trim$(Str$(SCOUNT)) + ".BMP"
+
+    CREATE_PALETTE_BMP BM2$, _TRUE
+
+    If InStr(BM$, Chr$(32)) Then
+        BM$ = Chr$(34) + BM$ + Chr$(34)
+    End If
+
+    Open F$ For Binary As #8
+    Put #8, , ImageData()
+    Close 8
+    Open FP$ For Binary As #8
+    Put #8, , VERAPAL()
+    Close #8
+    If VideoHeader.BPP < 8 And Bit_Map_Mode Then
+        Open F2$ For Binary As #8
+        Put #8, , ImageDataX_BPP()
+        Close 8
+        Open P$ For Binary As #8
+        Put #8, , VERAPALX_BPP()
+        Close 8
+    End If
+    Shell Magick$ + SRC_FRAME$ + " " + BM$
+    _SndPlay CAP_SND
+End Sub
+
+Sub SetSpriteSizes
+    If ImageWidth Mod 64 = 0 Then SprWidth = 64: GoTo SetSprHeight
+    If ImageWidth Mod 32 = 0 Then SprWidth = 32: GoTo SetSprHeight
+    SprWidth = 16
+    SetSprHeight:
+    If ImageHeight Mod 64 = 0 Then SprHeight = 64: Exit Sub
+    If ImageHeight Mod 32 = 0 Then SprHeight = 32: Exit Sub
+    If ImageHeight Mod 16 = 0 Then SprHeight = 16: Exit Sub
+    SprHeight = 8
+End Sub
+
+Sub SetBitMapMode
+    Dim bitdivisor As Integer
+    Dim PalNum As Integer
+    Dim I As Long
+    Dim Msg$
+
+
+    V_PADSIZE = 0
+    Bit_Map_Mode = _TRUE
+    VideoHeader.VTYPE = 3
+    VideoHeader.BPP = X_BITS
+
+    Select Case X_BITS
+        Case 1
+            UsedCols$ = "2"
+            PALETTE_SHIFTING_ENABLED = _FALSE
+        Case 2
+            UsedCols$ = "4"
+        Case 4
+            UsedCols$ = "16"
+            PALETTE_SHIFTING_ENABLED = _FALSE
+        Case 8
+            If Val(UsedCols$) = 0 Then UsedCols$ = "256"
+            If UsedCols$ = "256" Then
+                PALETTE_SHIFTING_ENABLED = _FALSE
+            End If
+    End Select
+
+    If EXPERT_MODE Then
+        MovieFPS$ = MM_FrameRate
+    Else
+        MovieFPS$ = GetDefaultFRM_Rate
+    End If
+
+    PalNum = Val(UsedCols$) - 1
+    Select Case X_BITS
+        Case 1
+            bitdivisor = 8
+        Case 2
+            bitdivisor = 4
+        Case 4
+            bitdivisor = 2
+        Case 8
+            bitdivisor = 1
+        Case Else
+            ErrorHalt "Error Setting Image Buffer.  Invalid Bitdepth: " + Str$(X_BITS)
+    End Select
+    sizex_bpp = ((ImageHeight * ImageWidth) / bitdivisor)
+
+
+    If sizex_bpp Mod 512 <> 0 _AndAlso Not FOR_VGA Then
+        DoPadFrame = _TRUE
+        I = Int(sizex_bpp / 512)
+        I = I + 1
+        V_PADSIZE = (I * 512) - sizex_bpp
+    End If
+
+    Msg$ = "X Bits: " + Str$(X_BITS) + CRLF
+    Msg$ = Msg$ + "Size Buffer: " + Str$(sizex_bpp) + CRLF
+
+    MM_STATUSTXT$ = Msg$
+
+    ReDim ImageData(0 To ((ImageHeight * ImageWidth) - 1)) As _Unsigned _Byte
+    If Not FOR_AMIGA Then
+        If sizex_bpp > 0 Then ReDim ImageDataX_BPP(0 To (sizex_bpp - 1))
+    End If
+    ReDim VERAPALX_BPP(0 To PalNum) As VPALTYPE
+End Sub
+
+Sub PUT_VGA16PALETTE
+    ' 16 entries of R, G, B (VGAPAL_TYPE, 6 bit values 0 to 63) = 48 bytes
+    Static P16(0 To 15) As VGAPAL_TYPE
+    Dim I As Integer
+    For I = 0 To 15
+        P16(I) = VGA_PALETTE(I)
+    Next
+    Put MainLFN, , P16()
+End Sub
+
+Sub VGA16_CheckPlanes
+    ' a wide picture is shorter than 200 lines: size the four planes to the frame that is being written
+    Dim need As Long
+    need = ((UBound(ImageData) + 1) \ 8) - 1
+    If UBound(QBUFF1) <> need Then
+        ReDim QBUFF1(0 To need) As _Unsigned _Byte
+        ReDim QBUFF2(0 To need) As _Unsigned _Byte
+        ReDim QBUFF3(0 To need) As _Unsigned _Byte
+        ReDim QBUFF4(0 To need) As _Unsigned _Byte
+    End If
+End Sub
+
+Sub VGA16_ShiftUp
+    ' The video is shorter than the screen, the player fills the rest with color 0: keep palette index 0 black.
+    ' The picture was made with 15 colors (indices 0 to 14); move them up one place.
+    Dim I As Long
+    For I = 15 To 1 Step -1
+        VGA_PALETTE(I) = VGA_PALETTE(I - 1)
+        ImagePalette(I) = ImagePalette(I - 1)
+    Next
+    VGA_PALETTE(0).R = 0: VGA_PALETTE(0).G = 0: VGA_PALETTE(0).B = 0
+    ImagePalette(0) = _RGB32(0, 0, 0, 255)
+    For I = 0 To UBound(ImageData)
+        ImageData(I) = ImageData(I) + 1
+    Next
+End Sub
+
+Sub PUT_AMIGAPALETTE
+    Dim L As Integer
+    Dim I As Integer
+    Select Case X_BITS
+        Case 4
+            L = 15
+        Case 3
+            L = 7
+        Case 2
+            L = 3
+        Case 1
+            L = 1
+    End Select
+    I = 0
+    Do
+        AMIGAPAL(I).R = VERAPAL(I).R
+        AMIGAPAL(I).GB = VERAPAL(I).GB
+        I = I + 1
+    Loop Until I > L
+    Put MainLFN, , AMIGAPAL()
+End Sub
+
+Sub PutAmiga_PlanarBuffer
+    Dim I As Long
+    Dim QI As Long
+    Dim I_Bit As Integer
+    Dim B As _Unsigned _Byte
+    Dim BV As _Unsigned _Byte
+    Dim Mq As _MEM
+    Mq = _Mem(QBUFF1())
+    _MemFill Mq, Mq.OFFSET, Mq.SIZE, 0 As _Unsigned _Byte
+    _MemFree Mq
+    If X_BITS > 1 Then
+        Mq = _Mem(QBUFF2())
+        _MemFill Mq, Mq.OFFSET, Mq.SIZE, 0 As _Unsigned _Byte
+        _MemFree Mq
+
+        If X_BITS > 2 Then
+            Mq = _Mem(QBUFF3())
+            _MemFill Mq, Mq.OFFSET, Mq.SIZE, 0 As _Unsigned _Byte
+            _MemFree Mq
+
+            If X_BITS > 3 Then
+                Mq = _Mem(QBUFF4())
+                _MemFill Mq, Mq.OFFSET, Mq.SIZE, 0 As _Unsigned _Byte
+                _MemFree Mq
+            End If
+        End If
+    End If
+
+    I = 0
+    QI = 0
+    Do
+        I_Bit = 7
+        Do
+            B = ImageData(I)
+            BV = _ShL(1, I_Bit) ' pixel's position inside the byte, leftmost = bit 7
+            If B And 1 Then QBUFF1(QI) = QBUFF1(QI) Or BV
+            If X_BITS > 1 Then If B And 2 Then QBUFF2(QI) = QBUFF2(QI) Or BV
+            If X_BITS > 2 Then If B And 4 Then QBUFF3(QI) = QBUFF3(QI) Or BV
+            If X_BITS > 3 Then If B And 8 Then QBUFF4(QI) = QBUFF4(QI) Or BV
+            I = I + 1
+            I_Bit = I_Bit - 1
+        Loop Until I_Bit < 0
+        QI = QI + 1
+    Loop Until I > UBound(ImageData)
+
+    Put MainLFN, , QBUFF1()
+    If X_BITS > 1 Then
+        Put MainLFN, , QBUFF2()
+        If X_BITS > 2 Then
+            Put MainLFN, , QBUFF3()
+            If X_BITS > 3 Then
+                Put MainLFN, , QBUFF4()
+            End If
+        End If
+    End If
+End Sub
+
+Sub PutModeX_PlanarBuffer
+    Dim I As Long
+    Dim J As Long
+
+    J = 0
+    I = 0
+    Do
+        QBUFF1(I) = ImageData(J)
+        QBUFF2(I) = ImageData(J + 1)
+        QBUFF3(I) = ImageData(J + 2)
+        QBUFF4(I) = ImageData(J + 3)
+        I = I + 1
+        J = J + 4
+    Loop Until I > UBound(QBUFF1)
+
+    Put MainLFN, , QBUFF1()
+    Put MainLFN, , QBUFF2()
+    Put MainLFN, , QBUFF3()
+    Put MainLFN, , QBUFF4()
+End Sub
+
+Sub UPSAMPLEIMAGE
+    Dim i As Integer
+    Static PIX1 As _Unsigned _Byte
+    Static PIX2 As _Unsigned _Byte
+    Static Px_2BPP(0 To 3) As _Unsigned _Byte
+    Static Px_1BPP(0 To 7) As _Unsigned _Byte
+    Static ShiftVal As Long
+    Static PixN As Long
+    Static MASK As _Unsigned _Byte
+    Static PIXINDX As Long
+    Static IMGINDX As Long
+    Static PIXELBUFFER As _Unsigned _Byte
+    PIXINDX = 0
+    IMGINDX = 0
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    Select Case VideoHeader.BPP
+        Case 4
+            Do
+                PIXELBUFFER = ImageDataX_BPP(IMGINDX)
+                PIX1 = _ShR((PIXELBUFFER And &HF0), 4)
+                PIX2 = PIXELBUFFER And &H0F
+                ImageData(PIXINDX) = PIX1
+                PIXINDX = PIXINDX + 1
+                ImageData(PIXINDX) = PIX2
+                IMGINDX = IMGINDX + 1
+                PIXINDX = PIXINDX + 1
+            Loop Until PIXINDX > UBound(ImageData)
+        Case 2
+            Do
+                MASK = &B11000000
+                ShiftVal = 8
+                PixN = 0
+                PIXELBUFFER = ImageDataX_BPP(IMGINDX)
+                Do
+                    ShiftVal = ShiftVal - 2
+                    Px_2BPP(PixN) = _ShR(PIXELBUFFER And MASK, ShiftVal)
+                    PixN = PixN + 1
+                    MASK = _ShR(MASK, 2)
+                Loop While ShiftVal
+                IMGINDX = IMGINDX + 1
+                For i = 0 To 3
+                    ImageData(PIXINDX + i) = Px_2BPP(i)
+                Next
+                PIXINDX = PIXINDX + 4
+            Loop Until PIXINDX > UBound(ImageData)
+        Case 1
+            Do
+                MASK = &B10000000
+                ShiftVal = 8
+                PixN = 0
+                PIXELBUFFER = ImageDataX_BPP(IMGINDX)
+                Do
+                    ShiftVal = ShiftVal - 1
+                    Px_1BPP(PixN) = _ShR(PIXELBUFFER And MASK, ShiftVal)
+                    PixN = PixN + 1
+                    MASK = _ShR(MASK, 1)
+                Loop While ShiftVal
+                IMGINDX = IMGINDX + 1
+                For i = 0 To 7
+                    ImageData(PIXINDX + i) = Px_1BPP(i)
+                Next
+                PIXINDX = PIXINDX + 8
+            Loop Until PIXINDX > UBound(ImageData)
+    End Select
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub DownSampleImage
+    Dim shifter As Integer
+    Dim shift_step As Integer
+    Dim PalNum As Integer
+    Dim ImgIndx As Long
+    Dim X_Indx As Long
+    Dim I As Long
+
+    PalNum = Val(UsedCols$) - 1
+    If X_BITS = 1 Then CheckVERAPal
+    Select Case X_BITS
+        Case 1
+            shifter = 7
+            shift_step = -1
+        Case 2
+            shifter = 6
+            shift_step = -2
+        Case 4
+            shifter = 4
+            shift_step = -4
+        Case Else
+            ErrorHalt "Error Converting Image Buffer.  Invalid Bitdepth: " + Str$(X_BITS)
+    End Select
+
+    ImgIndx = 0
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    X_Indx = 0
+    Do
+        ImageDataX_BPP(X_Indx) = 0
+        I = shifter
+        Do
+            ImageDataX_BPP(X_Indx) = ImageDataX_BPP(X_Indx) Or (_ShL(ImageData(ImgIndx), I))
+            ImgIndx = ImgIndx + 1
+            I = I + shift_step
+        Loop Until I < 0
+
+        If X_BITS = 1 Then
+            If DO_SWAP_1BPP Then
+                ImageDataX_BPP(X_Indx) = Not ImageDataX_BPP(X_Indx)
+            End If
+        End If
+
+        X_Indx = X_Indx + 1
+    Loop Until X_Indx = sizex_bpp
+
+    I = 0
+    Do
+        VERAPALX_BPP(I) = VERAPAL(I)
+        I = I + 1
+    Loop Until I > PalNum
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+End Sub
+
+Function IsValidXRes (x%)
+    IsValidXRes = (x% > 15) And (x% < 641) And (x% Mod 16) = 0
+End Function
+
+Function IsValidYRes (y%)
+    Dim MODCHECK As Integer
+    If ENABLE_SPI_SPRITES Then MODCHECK = 16 Else MODCHECK = 8
+    IsValidYRes = (y% > 15) And (y% < 481) And (y% Mod MODCHECK) = 0
+End Function
+
+Function MaxPossibleFrameRate
+    Dim default As Single
+    Dim adjuster
+    Dim TestBuffRate As _Unsigned Long
+    Dim TestBuffMax As _Unsigned Long
+
+    Dim CurRate As Single
+
+    ' These are practical maximum BYTE PER SECOND
+    ' frame --> VRAM rates on the Commander X16
+    ' They are "Near" the max theoritical !
+    ' The lower value is for the file block Read
+    ' routine MACPTR.  The 750000 value is for direct SPI
+    ' SD-Card access !
+    If FOR_VGA Then
+        TestBuffMax = 1256000
+    Else
+        If MAKE_SECTOR_VIDEO Then
+            TestBuffMax = 750000
+        Else
+            TestBuffMax = 180000
+        End If
+    End If
+
+    adjuster = 1
+    If VGA_16C Then
+        Palsize = 48
+    ElseIf FOR_VGA Or FULL_24BIT_PALETTE Then
+        Palsize = 768
+    Else
+        Palsize = 512
+    End If
+    If Make4BPP_VIDEO Then
+        adjuster = .5
+        If Not MAKE_SECTOR_VIDEO Then
+            Palsize = 32
+        End If
+    End If
+
+    If Bit_Map_Mode Then
+        Select Case X_BITS
+            Case 8
+                adjuster = 1
+            Case 4
+                adjuster = .5
+            Case 2
+                adjuster = .25
+            Case 1
+                adjuster = .125
+        End Select
+        If Not MAKE_SECTOR_VIDEO Then
+            Select Case X_BITS
+                Case 4
+                    Palsize = 32
+                Case 2
+                    Palsize = 8
+                Case 1
+                    Palsize = 4
+            End Select
+        End If
+    End If
+    BytesPerFrame = (ImageHeight * ImageWidth * adjuster) + Palsize
+    If (NO_LIMITS And Bit_Map_Mode) And (Not MAKE_SECTOR_VIDEO) Then
+        default = 60
+    Else
+        default = TestBuffMax / BytesPerFrame
+    End If
+    default = default * 100
+    default = Int(default)
+    default = default / 100
+    MaxPossibleFrameRate = default
+End Function
+
+Function GetDefaultFRM_Rate$
+    Dim default As Integer
+    Dim adjuster
+    Dim TestBuffRate As _Unsigned Long
+    Dim TestBuffMax As _Unsigned Long
+    If MAKE_SECTOR_VIDEO Then
+        TestBuffMax = 800000
+    Else
+        TestBuffMax = 180000
+    End If
+
+    default = 15
+    If NO_LIMITS And Bit_Map_Mode Then default = 24
+    adjuster = 1
+    If Make4BPP_VIDEO Then adjuster = .5
+    If Bit_Map_Mode Then
+        Select Case X_BITS
+            Case 8
+                adjuster = 1
+            Case 4
+                adjuster = .5
+            Case 2
+                adjuster = .25
+            Case 1
+                adjuster = .125
+        End Select
+    End If
+    tryagain:
+    TestBuffRate = default * ImageHeight * ImageWidth * adjuster
+    If (TestBuffRate > TestBuffMax) And (Not IS_DESKTOP_ONLY) Then
+        default = default - 1
+        GoTo tryagain
+    End If
+    Dim T As Integer
+    T = Int(default)
+    If (T + .7) >= default Then
+        default = T
+        GoTo done_rate
+    End If
+    default = T + .5
+    done_rate:
+    GetDefaultFRM_Rate$ = _Trim$(Str$(default))
+End Function
+
+Sub LOAD_PALETTE_FROM_FILE (PFILE$, IS_VERA_FILE%)
+    Dim PSIZE As _Unsigned Long
+    Dim I As Long
+    EXTPAL_FILEERROR = _FALSE
+    If Not _FileExists(PFILE$) Then
+        INFO_DIALOG "ERROR ", PFILE$ + " Not found", "error"
+        EXTPAL_FILEERROR = _TRUE
+        Exit Sub
+    End If
+    If IS_VERA_FILE% Then
+        Open PFILE$ For Binary As #11
+        PSIZE = LOF(11)
+        If PSIZE = 32 Or PSIZE = 512 Then
+            Get #11, , VERA_LOADED_PALETTE()
+            Close 11
+            If PSIZE = 32 Then
+                EXT_UPPER_COLOR = 15
+                For I = 16 To 255
+                    VERA_LOADED_PALETTE(I) = VERAPALDEFAULT(I)
+                Next
+            End If
+            Exit Sub
+        End If
+        INFO_DIALOG "ERROR ", PFILE$ + " Not a VERA PAL FILE", "error"
+        EXTPAL_FILEERROR = _TRUE
+    End If
+    Load_Image PFILE$
+    If _FileExists("IN.BMP") Then Kill "IN.BMP"
+    For I = 0 To 255
+        VERA_LOADED_PALETTE(I) = VERAPAL(I)
+    Next I
+End Sub
+
+Sub LOAD_DEFAULT_PALETTEMAP
+    Dim I As Long
+    For I = 0 To 255
+        VERA_LOADED_PALETTE(I) = VERAPALDEFAULT(I)
+    Next I
+End Sub
+
+Sub SET_MAP_TARGET (USEDEFAULT As Integer)
+    If USEDEFAULT Then
+        LOAD_DEFAULT_PALETTEMAP
+    End If
+    Dim I As Long
+    For I = 0 To 255
+        TARGET_PAL_FOR_MAPPING(I) = VERA2RGB(VERA_LOADED_PALETTE(I))
+        ImagePalette(I) = TARGET_PAL_FOR_MAPPING(I)
+    Next
+End Sub
+
+Sub WRITE_MAPFILE
+    MAP_BMPFILE_NAME$ = "COLMAPBMP.BMP"
+    CREATE_PALETTE_BMP MAP_BMPFILE_NAME$, _FALSE
+End Sub
+
+Sub SETUP_EXTP_METHOD1
+    SETUP_EXTP_METHOD2
+    WRITE_MAPFILE
+End Sub
+
+Sub SETUP_EXTP_METHOD2
+    LOAD_DEFAULT_PALETTEMAP
+    SET_MAP_TARGET _TRUE
+    EXTRA_CONVERT_MSG$ = "   Static Palette -> VERA default  "
+    EXTRA_CONVERT_MSG_T$ = "   {WHT}Static Palette {GRN}-{LIGHT GREEN}> {MAG}VERA {PURP}default{WHT}  "
+End Sub
+
+Sub SETUP_EXTP_METHOD3
+    SETUP_EXTP_METHOD4
+    WRITE_MAPFILE
+End Sub
+
+Sub SETUP_EXTP_METHOD4
+    Dim PFilename$, msg$, title$, EX$
+    Dim IS_VBIN As Integer
+    Dim Q As Integer
+    title$ = "CHOOSE A FILE WITH A PALETTE"
+    msg$ = "File may be one of the following: " + CRLF + CRLF
+    msg$ = msg$ + "     1. A Vera palette (bin,pal,vpal)" + CRLF
+    msg$ = msg$ + "     2. A Palettized Image"
+
+    INFO_DIALOG title$, msg$, "info"
+
+    TRYAGAIN:
+    PFilename$ = _OpenFileDialog$("X16 Movie Maker - Select File for palette Load", "", "*.bin|*.BIN|*.PAL|*.pal|*.VPAL|*.vpal|*.png|*.PNG|*.BMP|*.bmp|*.gif|*.GIF", "Files with Palettes", -1)
+    If _FileExists(PFilename$) Then
+        EX$ = UCase$(GetFileExt(PFilename$))
+        IS_VBIN = (EX$ = ".BIN") Or (EX$ = ".bin") Or (EX$ = ".PAL") Or (EX$ = ".VPAL")
+        If EX$ <> "" Then LOAD_PALETTE_FROM_FILE PFilename$, IS_VBIN
+    End If
+    If EX$ = "" Or EXTPAL_FILEERROR Then
+        msg$ = "An Error Occured during Palette Load." + CRLF + CRLF
+        msg$ = msg$ + "   Try Again ? "
+        If GotYES("PALETTE LOADING ERROR !", msg$, _TRUE) GoTo TRYAGAIN
+        EXIT_MOVIEMAKER
+    End If
+    SET_MAP_TARGET _FALSE
+    EXTRA_CONVERT_MSG$ = "   Static Palette -> From external File  "
+    EXTRA_CONVERT_MSG_T$ = "   {WHT}Static Palette {GRN}-{LIGHT GREEN}> {CYAN}From external File  {WHT}"
+End Sub
+
+Sub SETUP_EXTP_METHOD5
+    SETUP_EXTP_METHOD6
+    WRITE_MAPFILE
+End Sub
+
+Sub SETUP_EXTP_METHOD6
+    CREATE_AVERAGED_PALETTE
+    LOAD_PALETTE_FROM_FILE "outcolor.bmp", _FALSE
+    SET_MAP_TARGET _FALSE
+    EXTRA_CONVERT_MSG$ = "   Static Palette -> From source vid  "
+    EXTRA_CONVERT_MSG_T$ = "   {WHT}Static Palette {GRN}-{LIGHT GREEN}> {MAG}From source vid  {WHT}"
+End Sub
+
+Function FindNearest_MAPPED_COLOR_INDX% (SRC_PIXEL As _Unsigned _Byte)
+    Dim TmpIndx As Integer
+    Dim i As Long, LC As Long
+    Dim dr As Long, dg As Long, db As Long
+    Dim R As Long, G As Long, B As Long
+    Dim paletteR As Long, paletteG As Long, PaletteB As Long
+    Dim dist As Long
+    Dim bestDist As Long
+    bestDist = -1
+    TmpIndx = 0
+    LC = VERA2RGB(VERAPAL(SRC_PIXEL))
+    R = _Red32(LC)
+    G = _Green32(LC)
+    B = _Blue32(LC)
+
+    i = 0
+    Do
+        paletteR = _Red32(TARGET_PAL_FOR_MAPPING(i + EXT_OFFSET))
+        paletteG = _Green32(TARGET_PAL_FOR_MAPPING(i + EXT_OFFSET))
+        PaletteB = _Blue32(TARGET_PAL_FOR_MAPPING(i + EXT_OFFSET))
+
+        dr = R - paletteR
+        dg = G - paletteG
+        db = B - PaletteB
+
+        dist = 30 * dr * dr + 59 * dg * dg + 11 * db * db
+
+        If bestDist = -1 Or dist < bestDist Then
+            bestDist = dist
+            TmpIndx = i
+        End If
+
+        i = i + 1
+    Loop Until i > EXT_UPPER_COLOR
+    FindNearest_MAPPED_COLOR_INDX = TmpIndx
+End Function
+
+Sub MakeIndexZero_BLACK
+    Dim TmpIndx As Integer
+    Dim i As Long, LC As _Unsigned Long
+    Dim dr As Long, dg As Long, db As Long
+    Dim R As Long, G As Long, B As Long
+    Dim paletteR As Long, paletteG As Long, PaletteB As Long
+    Dim dist As Long
+    Dim bestDist As Long
+
+    If Not COLOR_IS_USED(0) Then GoTo BLACK_IT
+    bestDist = -1
+    TmpIndx = 0
+
+    R = _Red32(ImagePalette(0))
+    G = _Green32(ImagePalette(0))
+    B = _Blue32(ImagePalette(0))
+
+    If R = 0 _AndAlso G = 0 _AndAlso B = 0 Then Exit Sub
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    i = 1
+    Do
+        paletteR = _Red32(ImagePalette(i))
+        paletteG = _Green32(ImagePalette(i))
+        PaletteB = _Blue32(ImagePalette(i))
+
+        dr = R - paletteR
+        dg = G - paletteG
+        db = B - PaletteB
+
+        dist = 30 * dr * dr + 59 * dg * dg + 11 * db * db
+
+        If bestDist = -1 Or dist < bestDist Then
+            bestDist = dist
+            TmpIndx = i
+        End If
+        i = i + 1
+    Loop Until i = 256
+
+    i = 0
+    Do
+        If ImageData(i) = 0 Then ImageData(i) = TmpIndx
+        i = i + 1
+    Loop Until i > UBound(ImageData)
+
+    BLACK_IT:
+    VERAPAL(0).GB = 0
+    VERAPAL(0).R = 0
+    ImagePalette(0) = _RGB32(0, 0, 0, 255)
+    If FOR_VGA Then
+        VGA_PALETTE(0).R = 0
+        VGA_PALETTE(0).G = 0
+        VGA_PALETTE(0).B = 0
+    End If
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+End Sub
+
+Sub IMAGEDATA_MAP_PALETTE
+    Static I As _Unsigned Long
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    ' Only 256 different source indices exist, so find the nearest target
+    ' color once per index that is actually used (lazy table) instead of
+    ' once per pixel.
+    Static MapLUT(0 To 255) As Integer
+    Dim Px As _Unsigned _Byte
+    I = 0
+    Do
+        MapLUT(I) = -1
+        I = I + 1
+    Loop Until I = 256
+
+    I = 0
+    Do
+        Px = ImageData(I)
+        If MapLUT(Px) < 0 Then MapLUT(Px) = FindNearest_MAPPED_COLOR_INDX(Px)
+        ImageData(I) = MapLUT(Px)
+        I = I + 1
+    Loop Until I > UBound(ImageData)
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+End Sub
+
+Function PHYS_CORES&
+    ' cpu_cores counts logical processors (cores x threads per core).  Most
+    ' machines run 2 threads per core, so half of it is a better guess at
+    ' the real number of cores.
+    Dim N As Long
+    N = cpu_cores \ 2
+    If N < 1 Then N = 1
+    PHYS_CORES = N
+End Function
+
+Function THREAD_DEFAULT&
+    ' Suggested number of frames to convert at once.  Big machines have cores to
+    ' spare for the extra jobs; small ones need to keep a core free for the rest
+    ' of the system (and are often short on memory), so they get fewer.
+    ' 6 or more cores: cores + 2.   5 or fewer: cores - 1  (never below 1).
+    Dim N As Long
+    Dim C As Long
+    C = PHYS_CORES
+    If C >= 6 Then
+        N = C + 2
+    Else
+        N = C - 1
+    End If
+    If N > MAX_PIPE_THREADS Then N = MAX_PIPE_THREADS
+    If N < 1 Then N = 1
+    THREAD_DEFAULT = N
+End Function
+
+Sub SAVE_THREAD_CONFIG
+    Dim F As Long
+    F = FreeFile
+    Open ProjectHome$ + Slash$ + THREAD_CFG_NAME$ For Output As F
+    Print #F, "THREADS=" + _Trim$(Str$(MAGICK_PARALLEL))
+    Close F
+End Sub
+
+Sub UseCustom1BPP
+    Dim CVal1 As Integer
+    Dim CVal2 As Integer
+    Dim DoSwap As Integer
+
+    CVal1 = VERAPAL(0).GB + VERAPAL(0).R
+    CVal2 = VERAPAL(1).GB + VERAPAL(1).R
+    DoSwap = (CVal1 > CVal2)
+    If DoSwap Then
+        VERAPAL(1) = VERA_CUSTOM_BG
+        VERAPAL(0) = VERA_CUSTOM_FG
+    Else
+        VERAPAL(0) = VERA_CUSTOM_BG
+        VERAPAL(1) = VERA_CUSTOM_FG
+    End If
+
+    ImagePalette(0) = VERA2RGB(VERAPAL(0))
+    ImagePalette(1) = VERA2RGB(VERAPAL(1))
+End Sub
+
+Sub ForceBW
+    Dim CVal1 As Integer
+    Dim CVal2 As Integer
+    Dim DoSwap As Integer
+
+    CVal1 = VERAPAL(0).GB + VERAPAL(0).R
+    CVal2 = VERAPAL(1).GB + VERAPAL(1).R
+    DoSwap = (CVal1 > CVal2)
+    If DoSwap Then
+        VERAPAL(1).GB = 0
+        VERAPAL(1).R = 0
+        VERAPAL(0).GB = &HFF
+        VERAPAL(0).R = &H0F
+    Else
+        VERAPAL(0).GB = 0
+        VERAPAL(0).R = 0
+        VERAPAL(1).GB = &HFF
+        VERAPAL(1).R = &H0F
+    End If
+    ImagePalette(0) = VERA2RGB(VERAPAL(0))
+    ImagePalette(1) = VERA2RGB(VERAPAL(1))
+End Sub
+
+Sub InjectGreenPal
+    Dim PalEND As Integer
+    Dim I As Integer
+
+    Select Case X_BITS
+        Case 1
+            PalEND = 1
+        Case 2
+            PalEND = 3
+        Case 4
+            PalEND = 15
+    End Select
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    I = 0
+    Do
+        VERAPAL(I).GB = _ShL(VPAL_AVERAGE(VERAPAL(I)), 4)
+        VERAPAL(I).R = 0
+        ImagePalette(I) = VERA2RGB(VERAPAL(I))
+        I = I + 1
+    Loop Until I > PalEND
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub InjectAmberPal
+    Dim GMask As _Unsigned _Byte
+    Dim RMask As _Unsigned _Byte
+    Dim GVal As _Unsigned _Byte
+    Dim PalEnd As Integer
+    Dim I As Integer
+
+    GMask = &HA0
+    RMask = &H0E
+
+    Select Case X_BITS
+        Case 1
+            PalEnd = 1
+        Case 2
+            PalEnd = 3
+        Case 4
+            GMask = &HB0
+            RMask = &H0F
+            PalEnd = 15
+    End Select
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    I = 0
+    Do
+        GVal = VPAL_AVERAGE(VERAPAL(I))
+
+        Rem _Dest _Console
+        Rem Print GVal
+
+        Select Case GVal
+            Case 14, 15
+                VERAPAL(I).GB = &HB0
+                VERAPAL(I).R = &HF
+            Case 12, 13
+                VERAPAL(I).GB = &H90
+                VERAPAL(I).R = &HC
+            Case 10, 11
+                VERAPAL(I).GB = &H80
+                VERAPAL(I).R = &HA
+            Case 8, 9
+                VERAPAL(I).GB = &H60
+                VERAPAL(I).R = 8
+            Case 6, 7
+                VERAPAL(I).GB = &H40
+                VERAPAL(I).R = 6
+            Case 4, 5
+                VERAPAL(I).GB = &H30
+                VERAPAL(I).R = 4
+            Case 2, 3
+                VERAPAL(I).GB = &H20
+                VERAPAL(I).R = 3
+            Case 1
+                VERAPAL(I).GB = &H10
+                VERAPAL(I).R = 2
+            Case 0
+                Rem do nothing
+        End Select
+        ImagePalette(I) = VERA2RGB(VERAPAL(I))
+        I = I + 1
+    Loop Until I > PalEnd
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Function EXISTING_TARGETS$ (Name$)
+    ' Names of the files this conversion would write that are already there:
+    ' the movie, the first part of a split movie and, with separate audio, the
+    ' audio file.  "" when none exist.
+    Dim Base$, R$
+    Base$ = TARGET_FOLDER$ + GetFileName(Name$)
+    R$ = ""
+    If _FileExists(TARGET_FOLDER$ + Name$) Then R$ = R$ + Name$ + CRLF
+    If _FileExists(Base$ + PartName$(1) + ".SPV") Then R$ = R$ + GetFileName(Name$) + PartName$(1) + ".SPV" + CRLF
+    If Not Interleave_Audio Then
+        If _FileExists(Base$ + ".SVA") Then R$ = R$ + GetFileName(Name$) + ".SVA" + CRLF
+    End If
+    EXISTING_TARGETS = R$
+End Function
+
+Sub CountFrames (ext$)
+    Dim SUFFIX$, CHKFILE$
+    Dim Current&
+    If DO_JPG Then
+        Dim FNUM As Long
+        JPG_FRAMETOTALSIZE = 0
+    End If
+
+    SUFFIX$ = "0000000"
+    FrameCount = 0
+    Current& = 1
+    MM_Title "X16 Movie Maker - Counting Frames"
+    Do
+        If Current& = 10 Then SUFFIX$ = "000000"
+        If Current& = 100 Then SUFFIX$ = "00000"
+        If Current& = 1000 Then SUFFIX$ = "0000"
+        If Current& = 10000 Then SUFFIX$ = "000"
+        If Current& = 100000 Then SUFFIX$ = "00"
+        CHKFILE$ = SUFFIX$ + Mid$(Str$(Current&), 2) + ext$
+        If _FileExists(CHKFILE$) Then
+            FrameCount = FrameCount + 1
+            If DO_JPG Then
+                FNUM = FreeFile
+                Open CHKFILE$ For Binary As FNUM
+                JPG_FRAMETOTALSIZE = JPG_FRAMETOTALSIZE + LOF(FNUM)
+                Close FNUM
+            End If
+        End If
+        Current& = Current& + 1
+    Loop While _FileExists(CHKFILE$)
+    Cls
+End Sub
+
+Function VERA2RGB& (Vpal As VPALTYPE)
+    Dim grn As _Unsigned _Byte
+    Dim blu As _Unsigned _Byte
+    grn = Vpal.GB And &HF0
+    grn = grn Or _ShR(grn, 4)
+    blu = _ShL(Vpal.GB And &H0F, 4)
+    blu = blu Or _ShR(blu, 4)
+    VERA2RGB = _RGB32(_ShL(Vpal.R, 4) + Vpal.R, grn, blu, 255)
+End Function
+
+Sub Load_Image (ImgFile$)
+    Dim AddQuotes As Integer
+    Dim BadFile As Integer
+
+    If Not _FileExists(ImgFile$) Then
+        INFO_DIALOG "NOT FOUND", ImgFile$ + " NOT FOUND!", "error"
+        Print
+        BadFile = _TRUE
+        System
+    End If
+
+    If PIPE_ON Then
+        ' frames are being converted ahead of time in the background
+        PIPE_LOAD ImgFile$
+        Exit Sub
+    End If
+
+    ' (the image pre-filter has already run on the frame: inside the background job
+    '  of the conversion pipeline, or in the pre-filter only pipeline, see PF_WAIT)
+
+    If CX16_IMG_MODE Then
+        LOAD_IMAGEDATA_CX16 ImgFile$
+        Exit Sub
+    End If
+
+    AddQuotes = InStr(ImgFile$, Chr$(32)) > 0
+    If AddQuotes Then ImgFile$ = Chr$(34) + ImgFile$ + Chr$(34)
+    If _FileExists("IN.BMP") Then Kill "IN.BMP"
+    MagickIt ImgFile$, "IN.BMP"
+
+    LOAD_IMAGE_DATA "IN.BMP"
+End Sub
+
+Sub PrintPercent
+    Static TMP$
+    TMP$ = "##.##%"
+    Print Using TMP$; Percentage
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Image pre-filter.  The external command is run as   <command> <frame> <tmp>   and <tmp>
+'  then replaces the frame.  <tmp> has the frame's own extension (jpg in = jpg out,
+'  webp in = webp out, png in = png out), never a fixed one.
+'  - Conversion pipeline (background jobs): the pre-filter is the first step of each
+'    frame's job (see PIPE_LAUNCH), so it runs on the same threads.
+'  - Every other path (single thread, MJPG / WebP frames): a small pipeline of its own,
+'    PF_FILL / PF_WAIT, runs the pre-filter for the next frames in the background.
+' ---------------------------------------------------------------------------------
+Function PF_EXT$ (F$)
+    ' extension of a file name including the dot, ".png" when there is none
+    Dim I As Long
+    For I = Len(F$) To 1 Step -1
+        Select Case Mid$(F$, I, 1)
+            Case ".": PF_EXT = Mid$(F$, I): Exit Function
+            Case "/", "\": Exit For
+        End Select
+    Next
+    PF_EXT = ".png"
+End Function
+
+Function PF_CMD$ (N As Long, Src$)
+    ' the commands that pre-filter one frame in place (output and errors go to MP<n>.LOG)
+    Dim Tmp$
+    Tmp$ = "MP" + PIPE_NUM$(N) + PF_EXT$(Src$)
+    PF_CMD = PRE_FILTER_COMMAND$ + " " + Src$ + " " + Tmp$ + " >> MP" + PIPE_NUM$(N) + ".LOG 2>&1 && " + MoveOverCmd$ + Tmp$ + " " + Src$ + " > " + NULL$
+End Function
+
+Sub PF_SHOW (ImageF$)
+    MM_DestScr
+    If WantsPreview Then
+        Locate 31, 2
+    Else
+        Locate 33, 2
+    End If
+    Tprint " {WHT}Filter {LIGHT RED}--{YEL}> {LIGHT GREEN} " + PRE_FILTER_COMMAND$ + " {MAG}" + ImageF$
+End Sub
+
+Sub PF_KILLFILES (N As Long)
+    SAFE_KILL "MP" + PIPE_NUM$(N) + FrameExt$
+    SAFE_KILL "MP" + PIPE_NUM$(N) + ".OK"
+    SAFE_KILL "MP" + PIPE_NUM$(N) + ".ERR"
+    SAFE_KILL "MP" + PIPE_NUM$(N) + ".LOG"
+End Sub
+
+Sub PF_LAUNCH (N As Long)
+    Dim Src$, CMD$
+    Src$ = PIPE_NUM$(N) + FrameExt$
+    If Not _FileExists(Src$) Then Exit Sub ' the loader reports a missing frame
+    PF_KILLFILES N
+    CMD$ = PF_CMD$(N, Src$) + " && echo ok > MP" + PIPE_NUM$(N) + ".OK || echo x > MP" + PIPE_NUM$(N) + ".ERR"
+    $If WINDOWS Then
+        CMD$ = "cmd /c " + Chr$(34) + CMD$ + Chr$(34)
+    $End If
+    Shell _DontWait _Hide CMD$
+End Sub
+
+Sub PF_FILL (pBase As Long)
+    ' keep the pre-filter running on MAGICK_PARALLEL frames (at least 2), starting at pBase
+    Dim P As Long
+    P = MAGICK_PARALLEL
+    If P < 2 Then P = 2
+    Do While (PF_NEXT <= PF_END) And (PF_NEXT < pBase + P)
+        PF_LAUNCH PF_NEXT
+        PF_NEXT = PF_NEXT + 1
+    Loop
+End Sub
+
+Sub PF_CLEANUP
+    Dim N As Long
+    For N = PF_FIRST To PF_NEXT - 1
+        PF_KILLFILES N
+    Next
+    PF_NEXT = PF_FIRST
+    PF_ON = _FALSE
+End Sub
+
+Function PF_REPORT$ (N As Long, Src$, Why$)
+    ' leave the filter's output in the frames folder (removed with it at the end of the run)
+    Dim FF As Long
+    Dim P$
+    P$ = _CWD$
+    $If WINDOWS Then
+        If Right$(P$, 1) <> "\" Then P$ = P$ + "\"
+    $Else
+        If Right$(P$, 1) <> "/" Then P$ = P$ + "/"
+    $End If
+    P$ = P$ + "PREFILTER_ERROR.TXT"
+    FF = FreeFile
+    Open "PREFILTER_ERROR.TXT" For Output As FF
+    Print #FF, "Frame: "; N
+    Print #FF, "Command typed: "; PRE_FILTER_COMMAND$
+    Print #FF, "Command run: "; PF_CMD$(N, Src$)
+    Print #FF, "Folder: "; _CWD$
+    Print #FF, "Output of the filter (STDOUT and STDERR):"
+    Print #FF, Why$
+    Close FF
+    PF_REPORT = P$
+End Function
+
+Sub PF_WAIT (N As Long)
+    ' wait until frame N has been pre-filtered (starts the following frames meanwhile)
+    Dim Src$, Ok$, Er$, Lg$, Why$, L$, Rep$
+    Dim T As Double
+    Dim FF As Long
+    Src$ = PIPE_NUM$(N) + FrameExt$
+    Ok$ = "MP" + PIPE_NUM$(N) + ".OK"
+    Er$ = "MP" + PIPE_NUM$(N) + ".ERR"
+    Lg$ = "MP" + PIPE_NUM$(N) + ".LOG"
+    PF_FILL N
+    If Not _FileExists(Src$) Then Exit Sub ' the loader reports a missing frame
+    PF_SHOW Src$
+    T = Timer
+    Do
+        If _FileExists(Ok$) Then Exit Do
+        If _FileExists(Er$) Then Exit Do
+        If Timer < T Then T = Timer ' passed midnight
+        If Timer - T > MAGICK_TIMEOUT Then Exit Do
+        _Delay .001
+    Loop
+    If Not _FileExists(Ok$) Then
+        Why$ = "No result after " + _Trim$(Str$(MAGICK_TIMEOUT)) + " seconds." + CRLF
+        If _FileExists(Lg$) Then
+            Why$ = ""
+            FF = FreeFile
+            Open Lg$ For Input As FF
+            Do While (Not EOF(FF)) And (Len(Why$) < 800)
+                Line Input #FF, L$
+                Why$ = Why$ + L$ + CRLF
+            Loop
+            Close FF
+        End If
+        Rep$ = PF_REPORT$(N, Src$, Why$)
+        PF_CLEANUP
+        ErrorHalt "The image pre-filter failed on frame " + _Trim$(Str$(N)) + "." + CRLF + CRLF + "Command: " + PRE_FILTER_COMMAND$ + " " + Src$ + CRLF + CRLF + Why$ + CRLF + "Filter output: " + Rep$
+    End If
+    PF_FILL N + 1
+    PF_KILLFILES N
+End Sub
+
+Function MM_MagickCmd$
+    $If WINDOWS Then
+        MM_MagickCmd = "magick "
+    $Else
+        MM_MagickCmd = "convert "
+        If Shell("which convert > /dev/null 2>&1") <> 0 Then
+            If Shell("which magick > /dev/null 2>&1") = 0 Then MM_MagickCmd = "magick "
+        End If
+    $End If
+End Function
+
+Function MagickCmd$ (Infile$, Outfile$)
+    ' Builds the ImageMagick command line for one frame (no screen output)
+    Dim Grey$, CMD$, Sz$, Dither$
+
+    Grey$ = " -depth 8 "
+    If VideoHeader.BPP < 4 Then Grey$ = " -depth 4 "
+    If GrayScaleVideo Then Grey$ = " -colorspace Gray" + Grey$
+
+    CMD$ = Magick$ + Infile$ + " -compress none "
+
+    If Not Wipe_TMP_Files Then
+        Sz$ = Str$(ImageWidth) + "x" + Mid$(Str$(ImageHeight), 2) + "! "
+        CMD$ = CMD$ + " -resize " + Sz$
+    End If
+
+    If EXPERT_MODE And (ExtraMagick$ <> "") Then
+        Dither$ = ExtraMagick$
+    Else
+        Dither$ = " " + DITH_STR + " "
+    End If
+    CMD$ = CMD$ + Dither$
+    CMD$ = CMD$ + " -flip " + Grey$
+    CMD$ = CMD$ + "-colors " + UsedCols$
+
+    If ((EXT_PALETTE_METHOD = 1) And (Not Make4BPP_VIDEO)) Or EXT_PALETTE_METHOD = 3 Or EXT_PALETTE_METHOD = 5 Or EXT_PALETTE_METHOD = 7 Then
+        CMD$ = CMD$ + " -remap " + MAP_BMPFILE_NAME$ + " "
+    End If
+
+    CMD$ = CMD$ + " -type palette BMP3:" + Outfile$
+    MagickCmd = CMD$
+End Function
+
+Sub MagickShow (Infile$, CMD$)
+    ' The per frame progress text for a conversion
+    Dim FM$
+
+    MM_DestScr
+    If WantsPreview Then
+        Locate 30, 2
+    Else
+        Locate 32, 2
+    End If
+    Tprint "{WHT}FRAME{GRN}: {GRAY 1}"
+    _Dest _Console
+    Locate 4, 1
+    Color _RGB(0, 155, 0)
+    Print "FRAME: ";
+    Color _RGB(0, 175, 175)
+    FM$ = _Trim$(Str$(NUMBER_OF_USED_COLORS))
+    While Len(FM$) < 3
+        FM$ = "0" + FM$
+    Wend
+    _Dest _Console
+    Print Infile$ + "  # of Colors:" + FM$ + EXTRA_CONVERT_MSG$
+    MM_DestScr
+    Tprint "{YEL}" + Infile$ + "  {WHT}# {GRAY 1}of Colors{GRN}: {LIGHT GREEN}" + FM$ + "{MAG}" + EXTRA_CONVERT_MSG_T$ + "{GRAY 1}{13}"
+
+    _Dest _Console
+    Print
+    Print CMD$
+    MM_DestScr
+    If WantsPreview Then
+        Locate 32, 2
+    Else
+        Locate 33, 2
+    End If
+    $If WINDOWS Then
+        Const S1 = 7%
+        Const S2 = 8%
+        Const S3 = 20%
+    $Else
+        Const S1 = 8%
+        Const S2 = 9%
+        Const S3 = 21%
+    $End If
+    MM_ShowCmd CMD$, S1, S2, 12, S3
+End Sub
+
+' Prints the converter command word wrapped inside the orange border (at most 3 lines),
+' the first line colored like the old single line display.  Starts at the current cursor row.
+Sub MM_ShowCmd (CMD$, S1 As Integer, S2 As Integer, L2 As Integer, S3 As Integer)
+    Const CMDW = 82
+    Dim rest$, ln$, r As Long, n As Long, p As Long
+    r = CsrLin
+    rest$ = CMD$
+    n = 0
+    Do While rest$ <> "" And n < 3
+        If Len(rest$) <= CMDW Then
+            ln$ = rest$: rest$ = ""
+        Else
+            p = CMDW
+            Do While p > 1 And Mid$(rest$, p + 1, 1) <> " "
+                p = p - 1
+            Loop
+            If p <= 1 Then p = CMDW
+            ln$ = Left$(rest$, p)
+            rest$ = LTrim$(Mid$(rest$, p + 1))
+        End If
+        If n = 2 And rest$ <> "" Then ln$ = Left$(ln$, CMDW - 3) + "..."
+        ln$ = ln$ + Space$(CMDW + 2 - Len(ln$))
+        Locate r + n, 2
+        If n = 0 Then
+            Tprint "{GRN}" + Left$(ln$, S1) + "{LIGHT GREEN}" + Mid$(ln$, S2, L2) + "{ORG}" + Mid$(ln$, S2 + L2) + "{WHT}"
+        Else
+            Tprint "{ORG}" + ln$ + "{WHT}"
+        End If
+        n = n + 1
+    Loop
+End Sub
+
+Sub MagickIt (Infile$, Outfile$)
+    Dim CMD$
+    CMD$ = MagickCmd$(Infile$, Outfile$)
+    MagickShow Infile$, CMD$
+    Shell CMD$
+End Sub
+
+Sub SAFE_KILL (F$)
+    ' Windows will not delete a file that another process still has open (a
+    ' running job's redirect, or antivirus scanning a fresh file).  Retry for a
+    ' moment, then give up quietly.  A leftover file is harmless, it gets
+    ' removed again when its frame number is used or on the next run.
+    Dim Tries As Long
+    If Not _FileExists(F$) Then Exit Sub
+    For Tries = 1 To 20
+        SAFEKILL_FAILED = _FALSE
+        On Error GoTo KILLFAILED
+        Kill F$
+        On Error GoTo 0
+        If Not SAFEKILL_FAILED Then Exit Sub
+        _Delay .05
+    Next
+End Sub
+
+Function PIPE_NUM$ (N As Long)
+    Dim S$
+    S$ = _Trim$(Str$(N))
+    If Len(S$) < 8 Then S$ = String$(8 - Len(S$), "0") + S$
+    PIPE_NUM = S$
+End Function
+
+Sub PIPE_LAUNCH (N As Long)
+    Dim Src$, Fin$, Tmp$, Er$, Lg$, CMD$, PFX$
+    Src$ = PIPE_NUM$(N) + FrameExt$
+    Fin$ = "MQ" + PIPE_NUM$(N) + ".BMP"
+    Tmp$ = "MQ" + PIPE_NUM$(N) + ".TMP"
+    Er$ = "MQ" + PIPE_NUM$(N) + ".ERR"
+    Lg$ = "MQ" + PIPE_NUM$(N) + ".LOG"
+    If Not _FileExists(Src$) Then Exit Sub ' the loader reports a missing frame
+    PFX$ = ""
+    If RUN_PRE_FILTER Then
+        ' the image pre-filter is the first step of the job; MP<n>.OK marks that it finished
+        PF_KILLFILES N
+        PFX$ = PF_CMD$(N, Src$) + " && echo ok > MP" + PIPE_NUM$(N) + ".OK && "
+    End If
+    SAFE_KILL Fin$
+    SAFE_KILL Tmp$
+    SAFE_KILL Er$
+    SAFE_KILL Lg$
+    If CX16_IMG_MODE Then
+        ' cximg2bin writes <frame>.bin and <frame>.pal itself.  Fin$ is only a
+        ' marker, written once the program has finished and succeeded.
+        CMD$ = PFX$ + CX16_CMD$(Src$) + " > " + NULL$ + " 2>> " + Lg$
+        CMD$ = CMD$ + " && echo ok > " + Fin$
+        CMD$ = CMD$ + " || echo x > " + Er$
+        $If WINDOWS Then
+            ' one explicit command interpreter for the whole chain, quotes kept
+            ' around the program path (see the helper below)
+            CMD$ = "cmd /c " + Chr$(34) + CMD$ + Chr$(34)
+        $End If
+    ElseIf PIPE_FAST Then
+        ' the helper writes Tmp$ and renames it to Fin$ itself when done.  If
+        ' it fails it writes the reason into Er$ (the 6th argument).
+        CMD$ = PFX$ + Chr$(34) + FAST_HELPER$ + Chr$(34) + " " + Src$ + " " + Tmp$ + " " + Fin$
+        CMD$ = CMD$ + " " + _Trim$(Str$(ImageWidth)) + " " + _Trim$(Str$(ImageHeight)) + " " + Er$
+        ' anything the system prints (such as "not recognized") goes to Lg$
+        CMD$ = CMD$ + " >> " + Lg$ + " 2>&1"
+        CMD$ = CMD$ + " || echo the helper exited with an error or could not be started >> " + Er$
+        $If WINDOWS Then
+            ' Run the whole chain inside one explicit command interpreter (the
+            ' hidden background launch does not run it properly otherwise), and
+            ' wrap it in quotes so cmd keeps the quotes around the program path.
+            CMD$ = "cmd /c " + Chr$(34) + CMD$ + Chr$(34)
+        $End If
+    Else
+        CMD$ = PFX$ + MagickCmd$(Src$, Tmp$)
+        CMD$ = CMD$ + " 2>> " + Lg$ ' ImageMagick's own messages
+        CMD$ = CMD$ + " && " + MoveCmd$ + Tmp$ + " " + Fin$ + " > " + NULL$
+        CMD$ = CMD$ + " || echo x > " + Er$
+        $If WINDOWS Then
+            ' run the whole && / || chain inside one explicit command interpreter,
+            ' whatever _DontWait/_Hide do to the string.  (Nothing in it is quoted,
+            ' so cmd strips just these two outer quotes.)
+            CMD$ = "cmd /c " + Chr$(34) + CMD$ + Chr$(34)
+        $End If
+    End If
+    If N = PIPE_FIRST Then PIPE_DBGCMD$ = CMD$
+    Shell _DontWait _Hide CMD$
+End Sub
+
+Sub PIPE_FILL (pBase As Long)
+    ' keep MAGICK_PARALLEL frames, starting at Base, converting
+    Do While (PIPE_NEXT <= PIPE_END) And (PIPE_NEXT < pBase + MAGICK_PARALLEL)
+        PIPE_LAUNCH PIPE_NEXT
+        PIPE_NEXT = PIPE_NEXT + 1
+    Loop
+End Sub
+
+Sub PIPE_LOAD (ImgFile$)
+    Dim N As Long
+    Dim Fin$, Tmp$, Er$, Lg$
+    Dim T As Double
+    Dim GotIt As Integer
+    Dim Why$, L$
+    Dim FF As Long
+    Dim TimeLimit As Long
+    Dim PFFAIL As Integer
+    Dim Rep$
+
+    N = PIPE_CUR
+    Fin$ = "MQ" + PIPE_NUM$(N) + ".BMP"
+    Tmp$ = "MQ" + PIPE_NUM$(N) + ".TMP"
+    Er$ = "MQ" + PIPE_NUM$(N) + ".ERR"
+    Lg$ = "MQ" + PIPE_NUM$(N) + ".LOG"
+
+    PIPE_FILL N ' make sure this frame (and the ones after it) are running
+
+    T = Timer
+    GotIt = _FALSE
+    ' Until one background frame has come back, wait only a short while:
+    ' if nothing ever appears the setup is broken and the user must be told.
+    TimeLimit = MAGICK_TIMEOUT
+    If (Not PIPE_ANY_OK) And (Not CX16_IMG_MODE) Then TimeLimit = 30
+    Do
+        If _FileExists(Fin$) Then GotIt = _TRUE: Exit Do
+        If _FileExists(Er$) Then Exit Do
+        If Timer < T Then T = Timer ' passed midnight
+        If Timer - T > TimeLimit Then Exit Do
+        _Delay .001
+    Loop
+
+    If GotIt Then
+        PIPE_ANY_OK = _TRUE
+        If RUN_PRE_FILTER Then PF_SHOW ImgFile$
+        If CX16_IMG_MODE Then
+            PIPE_FILL N + 1 ' keep cximg2bin busy while this frame is handled
+            CX16_PRERUN = _TRUE
+            LOAD_IMAGEDATA_CX16 ImgFile$
+            CX16_PRERUN = _FALSE
+        ElseIf PIPE_FAST Then
+            PIPE_FILL N + 1 ' keep the helpers busy while this frame is handled
+            FAST_HELPER_FILE$ = Fin$
+            QB_LOADIMAGE_DATA ImgFile$
+            FAST_HELPER_FILE$ = ""
+        Else
+            MagickShow ImgFile$, MagickCmd$(ImgFile$, Fin$)
+            PIPE_FILL N + 1 ' keep the converters busy while this frame is handled
+            LOAD_IMAGE_DATA Fin$
+        End If
+        SAFE_KILL Fin$
+    Else
+        ' the background job failed or never finished.  (Er$ is read below and
+        ' removed at the end of this Sub.)
+        PFFAIL = RUN_PRE_FILTER And (Not _FileExists("MP" + PIPE_NUM$(N) + ".OK"))
+        If PIPE_FAST Or (Not PIPE_ANY_OK) Or PFFAIL Then
+            Why$ = "No result after " + _Trim$(Str$(TimeLimit)) + " seconds." + CRLF
+            If PFFAIL Then Why$ = "The image pre-filter (first step of the job) did not finish." + CRLF
+            If _FileExists(Er$) Then
+                Why$ = ""
+                FF = FreeFile
+                Open Er$ For Input As FF
+                Do While (Not EOF(FF)) And (Len(Why$) < 400)
+                    Line Input #FF, L$
+                    Why$ = Why$ + L$ + CRLF
+                Loop
+                Close FF
+            End If
+            If PFFAIL And _FileExists("MP" + PIPE_NUM$(N) + ".LOG") Then
+                FF = FreeFile
+                Open "MP" + PIPE_NUM$(N) + ".LOG" For Input As FF
+                Do While (Not EOF(FF)) And (Len(Why$) < 800)
+                    Line Input #FF, L$
+                    Why$ = Why$ + L$ + CRLF
+                Loop
+                Close FF
+            End If
+            If _FileExists(Lg$) Then
+                FF = FreeFile
+                Open Lg$ For Input As FF
+                Do While (Not EOF(FF)) And (Len(Why$) < 800)
+                    Line Input #FF, L$
+                    Why$ = Why$ + L$ + CRLF
+                Loop
+                Close FF
+            End If
+            ' write a report next to the frames so it can be sent along
+            FF = FreeFile
+            Open "MQ_FAST_FAILED.TXT" For Output As FF
+            Print #FF, "Frame: "; N
+            Print #FF, "Helper: "; FAST_HELPER$
+            Print #FF, "Fast path: "; PIPE_FAST
+            Print #FF, "Files at failure time:  TMP="; _FileExists(Tmp$); " BMP="; _FileExists(Fin$); " ERR="; _FileExists(Er$); " LOG="; _FileExists(Lg$); " SOURCE="; _FileExists(ImgFile$)
+            Print #FF, "Folder: "; _CWD$
+            Print #FF, "Threads: "; MAGICK_PARALLEL
+            Print #FF, "Command: "; PIPE_DBGCMD$
+            Print #FF, "Reason: "; Why$
+            Close FF
+            If PFFAIL Then
+                Why$ = Why$ + CRLF + "Command: " + PRE_FILTER_COMMAND$ + " " + ImgFile$ + CRLF
+                Rep$ = PF_REPORT$(N, ImgFile$, Why$)
+                Why$ = Why$ + "Filter output: " + Rep$ + CRLF
+            End If
+            PIPE_CLEANUP
+            PIPE_ON = _FALSE
+            If Not PIPE_FAST Then
+                ErrorHalt "The background conversion jobs never produced frame " + _Trim$(Str$(N)) + "." + CRLF + CRLF + Why$ + CRLF + "Set Convert Threads to 1 to avoid the background jobs." + CRLF + "Details are in MQ_FAST_FAILED.TXT in the frames folder."
+            End If
+            ErrorHalt "The FAST loading helper failed on frame " + _Trim$(Str$(N)) + "." + CRLF + CRLF + Why$ + CRLF + "Details are in MQ_FAST_FAILED.TXT" + CRLF + "in the frames folder."
+        ElseIf CX16_IMG_MODE Then
+            PIPE_FILL N + 1
+            CX16_PRERUN = _FALSE
+            LOAD_IMAGEDATA_CX16 ImgFile$
+        Else
+            SAFE_KILL "IN.BMP"
+            MagickIt ImgFile$, "IN.BMP"
+            PIPE_FILL N + 1
+            LOAD_IMAGE_DATA "IN.BMP"
+        End If
+    End If
+    SAFE_KILL Tmp$
+    SAFE_KILL Er$
+    SAFE_KILL Lg$
+    If RUN_PRE_FILTER Then PF_KILLFILES N
+End Sub
+
+Sub PIPE_CLEANUP
+    ' remove any files left by frames that were launched but not consumed
+    Dim N As Long
+    Dim F$
+    For N = PIPE_FIRST To PIPE_NEXT - 1
+        F$ = "MQ" + PIPE_NUM$(N) + ".BMP"
+        SAFE_KILL F$
+        F$ = "MQ" + PIPE_NUM$(N) + ".TMP"
+        SAFE_KILL F$
+        F$ = "MQ" + PIPE_NUM$(N) + ".ERR"
+        SAFE_KILL F$
+        F$ = "MQ" + PIPE_NUM$(N) + ".LOG"
+        SAFE_KILL F$
+        If RUN_PRE_FILTER Then PF_KILLFILES N
+    Next
+    PIPE_NEXT = PIPE_FIRST
+End Sub
+
+Sub GetSource_Parameters (VidFile$)
+    Dim TmpFile$, cmmd$, HW$, W$, H$
+    Dim L As Integer
+    Dim xPos As Integer
+
+    TmpFile$ = _Trim$(VidFile$)
+    If (Left$(TmpFile$, 1) <> Chr$(34)) And (InStr(1, TmpFile$, Chr$(32)) > 0) Then
+        TmpFile$ = Chr$(34) + TmpFile$ + Chr$(34)
+    End If
+    cmmd$ = "ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0  " + TmpFile$ + " > vid.par"
+    _Dest _Console
+    Color _RGB(255, 255, 255)
+    Print
+    Print cmmd$
+    Print
+    Shell cmmd$
+    MM_DestScr
+    Open "vid.par" For Input As #11
+    Line Input #11, HW$
+    Close #11
+    Kill "vid.par"
+    HW$ = _Trim$(HW$)
+    L = Len(HW$)
+    xPos = InStr(1, HW$, "x")
+    W$ = Left$(HW$, xPos - 1)
+    H$ = Right$(HW$, L - xPos)
+    Src_Height = Val(H$)
+    Src_Width = Val(W$)
+    Src_Aspect = Src_Width / Src_Height
+End Sub
+
+Sub COUNT_IMAGE_COLORS
+    Dim I As Long
+    Dim Pixel As _Unsigned _Byte
+    Dim UsedMEM As _MEM
+
+    ' Dim Shared COLOR_IS_USED(0 To 255) As Integer
+    ' Dim Shared NUMBER_OF_used_COLORS As Integer
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    NUMBER_OF_USED_COLORS = 0
+    PALETTE_IS_PACKED = _TRUE
+    UsedMEM = _Mem(COLOR_IS_USED())
+    _MemFill UsedMEM, UsedMEM.OFFSET, 512, 0 As _Unsigned _Byte
+
+    ' For I = 0 To 255
+    '  COLOR_IS_USED(I) = _FALSE
+    ' Next
+    I = 0
+    Do
+        Pixel = ImageData(I)
+        If Not COLOR_IS_USED(Pixel) Then
+            COLOR_IS_USED(Pixel) = _TRUE
+            NUMBER_OF_USED_COLORS = NUMBER_OF_USED_COLORS + 1
+            If NUMBER_OF_USED_COLORS = 256 Then Exit Sub
+        End If
+        I = I + 1
+    Loop Until I > UBound(ImageData)
+
+    I = 1
+    Do
+        If Not COLOR_IS_USED(I) _AndAlso (COLOR_IS_USED(I - 1) _AndAlso COLOR_IS_USED(I + 1)) Then
+            PALETTE_IS_PACKED = _FALSE
+            Exit Do
+        End If
+        I = I + 1
+    Loop Until I = 255
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub WRITE_JPEG_FRAME (INFILE$)
+    Static GOT_MEM As Integer
+    Dim TMPMEM As _MEM
+    Dim DO_RESIZE As Integer
+    Dim FDATA$, fm$
+    Dim TMPIMAGE As Long
+    Dim DESTIMAGE As Long
+    Dim ImageSize As Long
+    Dim I As Integer
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    If _FileExists(INFILE$) Then
+        FDATA$ = _ReadFile$(INFILE$)
+        If WantsPreview Then
+            If JPG_IMAGE <> 0 Then _FreeImage JPG_IMAGE
+            JPG_IMAGE = _LoadImage(FDATA$, 32, "MEMORY")
+        End If
+        JPEG_HEADER.SIZE = Len(FDATA$)
+        Put MainLFN, , JPEG_HEADER
+        Put MainLFN, , FDATA$
+    Else
+        COUT CRLF + " ERROR " + INFILE$ + " NOT FOUND !" + CRLF
+        _SndPlay ERROR_BEEP
+        MM_Delay .25
+        _SndPlay BEEP1
+        MM_Delay 1
+        System
+    End If
+
+    If GOT_MEM Then
+    Else
+        wid = ImageWidth
+        hei = ImageHeight
+        ImageSize = ImageWidth * ImageHeight
+        ReDim ImageData(0 To (ImageSize - 1)) As _Unsigned _Byte
+        GOT_MEM = _TRUE
+    End If
+    If WantsPreview Then
+        ' TMPMEM = _MemImage(TMPIMAGE)
+        ' _MemGet TMPMEM, TMPMEM.OFFSET, ImageData()
+
+
+        ' I = 0
+        ' Do
+        ' ImagePalette(I) = _PaletteColor(I, TMPIMAGE)
+        ' I = I + 1
+        ' Loop Until I = 256
+
+        ' _MemFree TMPMEM
+        ' _FreeImage TMPIMAGE
+
+        ' COUNT_IMAGE_COLORS
+        MM_DestScr
+        Locate 30, 2
+    Else
+        MM_DestScr
+        Locate 32, 2
+    End If
+    Tprint "{WHT}FRAME{GRN}: {GRAY 1}"
+    _Dest _Console
+    Locate 4, 1
+    Color _RGB(0, 155, 0)
+    Print "FRAME: ";
+    Color _RGB(0, 175, 175)
+    _Dest _Console
+    Print INFILE$ + " " + EXTRA_CONVERT_MSG$
+    MM_DestScr
+    Tprint "{YEL}" + INFILE$ + " " + EXTRA_CONVERT_MSG_T$ + "{GRAY 1}{13}"
+
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub QB_LOADIMAGE_DATA (INFILE$)
+    ' Takes the frame the MMFASTFRAME helper converted (FAST_HELPER_FILE$)
+    Static I As Long
+    Static TPAL As Long
+    Static fm$
+
+    MM_DestScr
+    If WantsPreview Then
+        Locate 30, 2
+    Else
+        Locate 32, 2
+    End If
+    Tprint "{WHT}FRAME{GRN}: {GRAY 1}"
+    _Dest _Console
+    Locate 4, 1
+    Color _RGB(0, 155, 0)
+    Print "FRAME: ";
+    Color _RGB(0, 175, 175)
+    fm$ = _Trim$(Str$(NUMBER_OF_USED_COLORS))
+    While Len(fm$) < 3
+        fm$ = "0" + fm$
+    Wend
+    _Dest _Console
+    Print INFILE$ + "  # of Colors:" + fm$ + EXTRA_CONVERT_MSG$
+    MM_DestScr
+    Tprint "{YEL}" + INFILE$ + "  {WHT}# {GRAY 1}of Colors{GRN}: {LIGHT GREEN}" + fm$ + "{MAG}" + EXTRA_CONVERT_MSG_T$ + "{GRAY 1}{13}"
+
+    ' The helper process (MMFASTFRAME) did the loading, just read its result.
+    If FAST_HELPER_FILE$ = "" Then ErrorHalt "FAST loading has no helper result to read."
+    If Not FAST_READ_HELPER Then
+        ErrorHalt "The FAST loading helper result is not valid:" + CRLF + FAST_HELPER_FILE$
+    End If
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    I = 0
+    Do
+        TPAL = FAST_PAL(I)
+        If FOR_VGA Then
+            VGA_PALETTE(I).R = _ShR(_Red32(TPAL), 2)
+            VGA_PALETTE(I).G = _ShR(_Green32(TPAL), 2)
+            VGA_PALETTE(I).B = _ShR(_Blue32(TPAL), 2)
+        End If
+        If FULL_24BIT_PALETTE Then
+            VGA_PALETTE(I).R = _Red32(TPAL)
+            VGA_PALETTE(I).G = _Green32(TPAL)
+            VGA_PALETTE(I).B = _Blue32(TPAL)
+        End If
+        VERAPAL(I).R = _ShR(_Red32(TPAL), 4)
+        VERAPAL(I).GB = (_Green32(TPAL) And &HF0) Or _ShR(_Blue32(TPAL), 4)
+        ImagePalette(I) = TPAL
+        I = I + 1
+    Loop Until I = 256
+
+    COUNT_IMAGE_COLORS
+
+    If PALETTE_SHIFTING_ENABLED And NUMBER_OF_USED_COLORS < 256 Then
+        SHIFT_THE_PALETTE
+    End If
+
+    If WIDE_DISPLAY Or K_TYPE Or WANT_A_TALLVIDEO Then
+        MakeIndexZero_BLACK
+    End If
+
+End Sub
+
+Function FAST_HELPER_PATH$
+    ' Looks for MMFASTFRAME next to this program.  "" if it is not there.
+    Dim E$, D$, N$
+    N$ = "MMFASTFRAME"
+    $If WINDOWS Then
+        N$ = N$ + ".exe"
+    $End If
+    N$ = MY_INSTALL_DIR$ + N$
+    If Not _FileExists(N$) Then
+        FAST_HELPER_PATH = ""
+    Else
+        FAST_HELPER_PATH = N$
+    End If
+End Function
+
+Function FAST_READ_HELPER%
+    ' Reads a frame written by MMFASTFRAME: 256 palette Longs, then the pixels.
+    Dim F As Long
+    Dim Size As Long
+    FAST_READ_HELPER = _FALSE
+    If Not _FileExists(FAST_HELPER_FILE$) Then Exit Function
+    Size = ImageWidth * ImageHeight
+    F = FreeFile
+    Open FAST_HELPER_FILE$ For Binary Access Read As F
+    If LOF(F) <> (1024 + Size) Then
+        Close F
+        Exit Function
+    End If
+    If UBound(ImageData) <> (Size - 1) Then ReDim ImageData(0 To (Size - 1)) As _Unsigned _Byte
+    Get F, , FAST_PAL()
+    Get F, , ImageData()
+    Close F
+    wid = ImageWidth
+    hei = ImageHeight
+    FAST_READ_HELPER = _TRUE
+End Function
+
+Sub SHIFT_THE_PALETTE
+    Dim HIGHPAL As Integer
+    Dim I As Long
+    HIGHPAL = HighestPalFree
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    Rem Shift Used Colors and Image data UP in the Palette
+    Rem fill unused lower indices with VERA default values
+
+    SWAP_PENDING = _FALSE
+    I = 0
+    Do
+        If I < HIGHPAL Then
+            SwapPaletteColors I, HIGHPAL
+            HIGHPAL = HighestPalFree
+        End If
+        I = I + 1
+    Loop Until I = 256
+    If SWAP_PENDING Then
+        ' one pass over the image applies every swap
+        I = 0
+        Do
+            ImageData(I) = SWAP_REMAP(ImageData(I))
+            I = I + 1
+        Loop Until I > UBound(ImageData)
+        SWAP_PENDING = _FALSE
+    End If
+    I = 0
+    Do
+        If Not COLOR_IS_USED(I) Then
+            VERAPAL(I) = VERAPALDEFAULT(I)
+            ImagePalette(I) = VERA2RGB(VERAPALDEFAULT(I))
+        End If
+        I = I + 1
+    Loop Until I = 256
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub LOAD_IMAGE_DATA (INBMP$)
+    ReDim InBuffer(0 To 1) As _Unsigned _Byte
+    Dim InPixels As _Unsigned _Byte
+    Dim Pix(1 To 8) As _Unsigned _Byte
+    Dim Pix1 As _Unsigned _Byte
+    Dim Pix2 As _Unsigned _Byte
+    Dim BmpHeader As BMPHeaderType2
+    Dim BMPal(0 To 255) As BPalType
+    Dim ImageSize As _Unsigned Long
+    Dim Pix As _Unsigned _Byte
+    Dim Pad As Integer
+    Dim I%, PI%
+    Dim IIndx As Long
+    Dim I As Long
+    Dim I_END As Long
+    Dim JI As Integer
+    Dim Y As Long
+    Dim X As Long
+    Dim P As Long
+    Dim ImageLFN As Long
+    Static SHIFTER As Integer
+
+
+    ImageLFN = 13
+    Open INBMP$ For Binary As ImageLFN
+    Get ImageLFN, , BmpHeader
+    Get ImageLFN, , BMPal()
+
+
+    Pad = BmpHeader.wid Mod 4
+    If Pad > 0 Then Pad = 4 - Pad
+
+
+    ImageSize = BmpHeader.hei * BmpHeader.wid
+    ReDim ImageData(0 To (ImageSize - 1)) As _Unsigned _Byte
+    wid = BmpHeader.wid
+    hei = BmpHeader.hei
+
+    ' A$ = BmpHeader.pal ' Pal is stored in a 1024 character string
+
+    I% = 1
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    'For PI% = 0 To 255
+    '   b% = Int(Asc(Mid$(A$, I%, 1)) \ 16) 'blue
+    'g% = Int(Asc(Mid$(A$, I% + 1, 1)) \ 16) 'green
+    'r% = Int(Asc(Mid$(A$, I% + 2, 1)) \ 16) 'red
+    ' I% + 3 is alpha channel which we DO NOT use.
+    'gb% = Int((g% * 16) + b%)
+    'VERAPAL(PI%).GB = gb%
+    'VERAPAL(PI%).R = r%
+    'I% = I% + 4
+    'If SKIP_OVER_DISPLAYPAL_UPDATE GoTo coFor
+    'ImagePalette(PI%) = VERA2RGB(VERAPAL(PI%))
+    'coFor:
+    'Next PI%
+
+
+    PI% = 0
+    Do
+        ' VERAPAL(PI%).GB = _ShL(ColChannel8to4(BMPal(PI%).G), 4) Or ColChannel8to4(BMPal(PI%).B)
+        ' VERAPAL(PI%).R = ColChannel8to4(BMPal(PI%).R)
+        VERAPAL(PI%).R = _ShR(BMPal(PI%).R, 4)
+        VERAPAL(PI%).GB = (BMPal(PI%).G And &HF0) Or _ShR(BMPal(PI%).B, 4)
+
+        If FOR_VGA _OrElse FULL_24BIT_PALETTE Then
+            VGA_PALETTE(PI%).R = _ShR(BMPal(PI%).R, 2)
+            VGA_PALETTE(PI%).G = _ShR(BMPal(PI%).G, 2)
+            VGA_PALETTE(PI%).B = _ShR(BMPal(PI%).B, 2)
+        End If
+        If FULL_24BIT_PALETTE Then
+            VGA_PALETTE(PI%).R = BMPal(PI%).R
+            VGA_PALETTE(PI%).G = BMPal(PI%).G
+            VGA_PALETTE(PI%).B = BMPal(PI%).B
+        End If
+        ImagePalette(PI%) = _RGB32(BMPal(PI%).R, BMPal(PI%).G, BMPal(PI%).B, 255)
+        PI% = PI% + 1
+    Loop Until PI% = 256
+
+
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+    Seek ImageLFN, BmpHeader.offset + 1
+
+
+    If BmpHeader.bpp = 1 Then
+        IIndx = 0
+        $If CHECK_ERRORS = FALSE Then
+            $Checking:Off
+        $End If
+        ReDim InBuffer(0 To (ImageSize / 8 - 1))
+        Get ImageLFN, , InBuffer()
+        I = 0
+        I_END = (ImageSize / 8)
+        Do
+
+            InPixels = InBuffer(I)
+            JI = 1
+            Do
+                Pix(JI) = 0
+                JI = JI + 1
+            Loop Until JI = 9
+
+            If (InPixels And 128) = 128 Then Pix(1) = 1
+
+            If (InPixels And 64) = 64 Then Pix(2) = 1
+
+            If (InPixels And 32) = 32 Then Pix(3) = 1
+
+            If (InPixels And 16) = 16 Then Pix(4) = 1
+
+            If (InPixels And 8) = 8 Then Pix(5) = 1
+
+            If (InPixels And 4) = 4 Then Pix(6) = 1
+
+            If (InPixels And 2) = 2 Then Pix(7) = 1
+
+            If (InPixels And 1) = 1 Then Pix(8) = 1
+
+            JI = 1
+            Do
+                ImageData(IIndx) = Pix(JI)
+                IIndx = IIndx + 1
+                JI = JI + 1
+            Loop Until JI = 9
+
+            I = I + 1
+        Loop Until I = I_END
+        $If CHECK_ERRORS = FALSE Then
+            $Checking:Off
+        $End If
+
+        GoTo skip8bpp
+    End If
+
+    If BmpHeader.bpp = 2 Then
+        _Dest _Console
+        Print "2 BIT FOUND"
+        MM_DestScr
+    End If
+
+    If BmpHeader.bpp = 4 Then
+        IIndx = 0
+        $If CHECK_ERRORS = FALSE Then
+            $Checking:Off
+        $End If
+        ReDim InBuffer(0 To (ImageSize / 2 - 1))
+        Get ImageLFN, , InBuffer()
+
+        I = 0
+        I_END = (ImageSize / 2)
+        Do
+            InPixels = InBuffer(I)
+            Pix2 = Int(InPixels / 16)
+            Pix1 = InPixels And 15
+            ImageData(IIndx) = Pix2
+            IIndx = IIndx + 1
+            ImageData(IIndx) = Pix1
+            IIndx = IIndx + 1
+            I = I + 1
+        Loop Until I = I_END
+
+        GoTo skip8bpp
+    End If
+
+
+    If Pad = 0 Then
+        Get ImageLFN, , ImageData()
+    Else
+        I = 0
+        $If CHECK_ERRORS = FALSE Then
+            $Checking:Off
+        $End If
+        Y = 1
+        Do
+            X = 1
+            Do
+                Get ImageLFN, , ImageData(I)
+                I = I + 1
+                X = X + 1
+            Loop Until X > BmpHeader.wid
+            For P = 1 To Pad: Get ImageLFN, , Pix: Next P
+            Y = Y + 1
+        Loop Until Y > BmpHeader.hei
+        $If CHECK_ERRORS = FALSE Then
+            $Checking:On
+        $End If
+    End If
+
+    skip8bpp:
+
+    Close ImageLFN
+    Rem Count How Many Colors are used in this image
+    Close 1
+    COUNT_IMAGE_COLORS
+    If PALETTE_SHIFTING_ENABLED Then
+        If Make4BPP_VIDEO Or EXT_PALETTE_ON Or NUMBER_OF_USED_COLORS = 256 Then
+            PALETTE_SHIFTING_ENABLED = _FALSE
+        End If
+    End If
+
+    If PALETTE_SHIFTING_ENABLED Then
+        SHIFT_THE_PALETTE
+    Else
+        I = 0
+        Do
+            If Not COLOR_IS_USED(I) Then
+                VERAPAL(I) = VERAPALDEFAULT(I)
+                ImagePalette(I) = VERA_DEFAULT_PALETTE_EXPANDED(I)
+            End If
+            I = I + 1
+        Loop Until I = 256
+
+    End If
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+End Sub
+
+Sub SETUP_CX16_BUFFERS
+    Dim bitdivisor As Integer
+    Dim psize As Integer
+    wid = ImageWidth
+    hei = ImageHeight
+    ReDim ImageData(0 To (ImageHeight * ImageWidth) - 1) As _Unsigned _Byte
+    If X_BITS < 8 Then
+        Select Case X_BITS
+            Case 4
+                bitdivisor = 2
+                psize = 16
+            Case 2
+                bitdivisor = 4
+                psize = 4
+            Case 3
+                bitdivisor = 8
+                psize = 2
+        End Select
+        ReDim ImageDataX_BPP(0 To ((ImageHeight * ImageWidth) \ bitdivisor) - 1) As _Unsigned _Byte
+        ReDim VERAPALX_BPP(0 To (psize - 1)) As VPALTYPE
+    End If
+End Sub
+
+Function CX16_CMD$ (INFIL$)
+    ' The cximg2bin command line for one frame (no redirects).  Used both for the
+    ' direct run and for the background jobs.
+    Dim CMD$
+    CMD$ = CX16_IMGCMD$
+    CMD$ = CMD$ + " " + INFIL$ + " -w " + _Trim$(Str$(ImageWidth)) + " -h " + _Trim$(Str$(ImageHeight)) + " -bpp " + _Trim$(Str$(X_BITS))
+    Select Case X_BITS
+        Case 8
+            If Val(UsedCols$) < 256 Then
+                CMD$ = CMD$ + " -colors " + UsedCols$
+            End If
+        Case Else
+            ' Nothing needed
+    End Select
+    CMD$ = CMD$ + " --output-type binpal "
+    If USE_YOLO And CMD_EXTRA$ = "" Then
+        CMD_EXTRA$ = "-yolo "
+    End If
+    CMD$ = CMD$ + CMD_EXTRA$
+    CX16_CMD = CMD$
+End Function
+
+Sub LOAD_IMAGEDATA_CX16 (INFIL$)
+    ' Dim Shared MY_PATH$
+    ' Dim Shared CX16_IMGCMD$
+    ' Dim Shared CX16_IMG_AVAILABLE As Integer
+    ' Dim Shared CX16_IMG_MODE As Integer
+    ' ReDim Shared CX16_IMGDATA(0 To 2) As _Unsigned _Byte
+    ' ReDim Shared CX16_PALDATA(0 To 2) As VPALTYPE
+
+    Dim F1 As Long
+    Dim F2 As Long
+    Dim F_IMG As String
+    Dim F_PAL As String
+    Dim CMD$
+    Dim Pix As _Unsigned _Byte
+    Dim Pad As Integer
+    Dim I%, PI%
+    Dim IIndx As Long
+    Dim I As Long
+    Dim I_END As Long
+    Dim JI As Integer
+    Dim Y As Long
+    Dim X As Long
+    Dim FM$
+    MM_DestScr
+    If WantsPreview Then
+        Locate 30, 2
+    Else
+        Locate 32, 2
+    End If
+    Tprint "{WHT}FRAME{GRN}: {GRAY 1}"
+    _Dest _Console
+    Locate 4, 1
+    Color _RGB(0, 155, 0)
+    Print "FRAME: ";
+    Color _RGB(0, 175, 175)
+    FM$ = _Trim$(Str$(NUMBER_OF_USED_COLORS))
+    While Len(FM$) < 3
+        FM$ = "0" + FM$
+    Wend
+    _Dest _Console
+    Print INFIL$ + "  # of Colors:" + FM$ + EXTRA_CONVERT_MSG$
+    MM_DestScr
+    Tprint "{YEL}" + INFIL$ + "  {WHT}# {GRAY 1}of Colors{GRN}: {LIGHT GREEN}" + FM$ + "{MAG}" + EXTRA_CONVERT_MSG_T$ + "{GRAY 1}{13}"
+
+    F_IMG = GetFileName(INFIL$)
+    F_PAL = F_IMG + ".pal"
+    F_IMG = F_IMG + ".bin"
+    CMD$ = CX16_CMD$(INFIL$)
+
+    _Dest _Console
+    Print
+    Print CMD$
+    MM_DestScr
+    If WantsPreview Then
+        Locate 32, 2
+    Else
+        Locate 33, 2
+    End If
+    Dim S1 As Integer
+    Dim S2 As Integer
+    Dim S3 As Integer
+    S1 = Len(CX16_IMGCMD$)
+    S2 = S1 + 1
+    S3 = S2 + 13
+    MM_ShowCmd CMD$, S1, S2, 13, S3
+
+    CMD$ = CMD$ + " > " + NULL
+
+    If Not CX16_PRERUN Then Shell CMD$
+    F1 = FreeFile
+    Open F_IMG For Binary As F1
+    F2 = FreeFile
+    Open F_PAL For Binary As F2
+    If X_BITS = 8 Then
+        Get F1, , ImageData()
+        Get F2, , VERAPAL()
+    Else
+        Get F1, , ImageDataX_BPP()
+        Get F2, , VERAPALX_BPP()
+        UPSAMPLEIMAGE
+    End If
+    Close F1
+    Close F2
+
+    COUNT_IMAGE_COLORS
+    If PALETTE_SHIFTING_ENABLED Then
+        If Make4BPP_VIDEO Or EXT_PALETTE_ON Or NUMBER_OF_USED_COLORS = 256 Then
+            PALETTE_SHIFTING_ENABLED = _FALSE
+        End If
+    End If
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    I = 0
+    If X_BITS = 8 Then
+        Do
+            ImagePalette(I) = VERA2RGB(VERAPAL(I))
+            I = I + 1
+        Loop Until I = 256
+    Else
+        Do
+            ImagePalette(I) = VERA2RGB(VERAPALX_BPP(I))
+            I = I + 1
+        Loop Until I > UBound(VERAPALX_BPP)
+    End If
+
+    If PALETTE_SHIFTING_ENABLED Then
+        SHIFT_THE_PALETTE
+    Else
+        I = 0
+        Do
+            If Not COLOR_IS_USED(I) Then
+                VERAPAL(I) = VERAPALDEFAULT(I)
+                ImagePalette(I) = VERA_DEFAULT_PALETTE_EXPANDED(I)
+            End If
+            I = I + 1
+        Loop Until I = 256
+    End If
+
+    Rem Shift Used Colors and Image data UP in the Palette
+    Rem fill unused lower indices with VERA default values
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub GetSprite (X As Integer, Y As Integer)
+    Dim GoLine As Integer
+    Dim SprIndex As Integer
+    Dim SLine As Integer
+    Dim ImgIndex As Long
+    Dim I As Long
+    Dim LineEnd As Long
+
+    GoLine = Y
+    SprIndex = 0
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    SLine = 0
+
+
+    Do
+        ImgIndex = ((GoLine * ImageWidth)) + (X)
+        I = ImgIndex
+        LineEnd = (ImgIndex + SprWidth)
+        Do
+            Sprite(SprIndex) = ImageData(I)
+            SprIndex = SprIndex + 1
+            I = I + 1
+        Loop Until I = LineEnd
+
+        GoLine = GoLine + 1
+
+        SLine = SLine + 1
+    Loop Until SLine = SprHeight
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+End Sub
+
+Sub Make4bitSprite
+    Static EndIndx
+    Dim p1 As _Unsigned _Byte
+    Dim p2 As _Unsigned _Byte
+    Dim SIndx8Bpp As Long
+    Dim SIndx4Bpp As Long
+
+    If EndIndx = 0 Then EndIndx = ((SprWidth * SprHeight) / 2) - 1
+    SIndx8Bpp = 0
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    For SIndx4Bpp = 0 To EndIndx
+        p1 = Sprite(SIndx8Bpp)
+        SIndx8Bpp = SIndx8Bpp + 1
+        p2 = Sprite(SIndx8Bpp)
+        SIndx8Bpp = SIndx8Bpp + 1
+        Sprite4BPP(SIndx4Bpp) = _ShL(p1, 4) Or p2
+        Rem Print p1, p2, Sprite4BPP(SIndx4BPP)
+    Next
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+End Sub
+
+Sub Grab4BitPalette
+    Dim i%
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+
+    For i% = 0 To 15
+        VERAPAL4BPP(i%) = VERAPAL(i%)
+    Next
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+End Sub
+
+Sub MakeDisplayGRAY
+    Dim r As Integer
+    Dim g As Integer
+    Dim b As Integer
+    Dim i As Long
+    r = 0
+    b = 0
+    g = 0
+    For i = 0 To 15
+        ImagePalette(i) = _RGB32(r, g, b, 255)
+        r = r + 16
+        b = b + 16
+        g = g + 16
+    Next
+End Sub
+
+Sub InstallDependency (DepNum As Integer)
+    Select Case DepNum
+        Case 1, 2
+            InstallFFMPEG
+        Case 3
+            InstallImageMagick
+    End Select
+End Sub
+
+Sub InstallFFMPEG
+    Dim HomePage$
+    Dim X As Integer
+    Dim USE_WINGET As Integer
+
+    HomePage$ = "https://www.ffmpeg.org"
+    X = _MessageBox("Open FFMPEG Home Page", "Missing ffmpeg or ffprobe." + CRLF + "      (Required)" + CRLF + "Do You want to Open the FFMPEG Home Page ?", "yesno", "question", 0)
+    If X = 1 Then Shell SystemOpen$ + HomePage$
+
+    $If WINDOWS Then
+        MM_Nop
+        If IsInstalled("WINGET") Then
+            USE_WINGET = _MessageBox("USE WINGET ? ", "Install ffmpeg with WINGET ?", "yesno", "question", 0)
+            If USE_WINGET = 1 Then
+                Shell ("CMD /C winget install ffmpeg")
+            End If
+            If USE_WINGET And IsInstalled("ffmpeg") Then
+                GoTo DONEWINDOWS
+            End If
+        End If
+        Dim J As Integer
+
+        J = _MessageBox("Attempt Direct Download of FFMPEG archive ", "Do You want to download Now ?", "yesno", "question", 0)
+        If J = 1 Then
+            X = _MessageBox("Attempt Download of source #1", "Do You want to download from " + CRLF + "https://github.com/BtbN/FFmpeg-Builds/", "yesno", "question", 0)
+            If X = 1 Then Shell ("start  https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip")
+            If X = 1 Then GoTo EndWinInstall
+            X = _MessageBox("Attempt Download of source #2", "Do You want to download from " + CRLF + "https://www.gyan.dev", "yesno", "question", 0)
+            If X = 1 Then Shell ("start https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-2025-05-07-git-1b643e3f65-essentials_build.7z")
+            EndWinInstall:
+            MM_Nop
+            GoTo FinishFInstall
+        End If
+        DONEWINDOWS:
+        MM_Nop
+    $End If
+
+    $If LINUX Then
+        If IsInstalled("apt") Then
+            X = _MessageBox("Install with apt", "Attempt FFMPEG install with apt ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("apt install ffmpeg")
+                GoTo FinishFInstall
+            End If
+        End If
+        If IsInstalled("yum") Then
+            X = _MessageBox("Install with Yum", "Attempt FFMPEG install with Yum ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("yum install ffmpeg")
+                GoTo FinishFInstall
+            End If
+        End If
+        If IsInstalled("brew") Then
+            X = _MessageBox("Install with Brew", "Attempt FFMPEG install with HomeBrew ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("brew install ffmpeg")
+                GoTo FinishFInstall
+            End If
+        End If
+    $End If
+
+    $If MAC Then
+        If IsInstalled("brew") Then
+            X = _MessageBox("Install with Brew", "Attempt FFMPEG install with HomeBrew ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("brew install ffmpeg")
+                GoTo FinishFInstall
+            End If
+        End If
+    $End If
+
+    FinishFInstall:
+    X = _MessageBox("X16 Movie Maker ", "Continue Opening X16 Movie Maker ? " + CRLF + "(If you have installed the FFMPEG package.)", "yesno", "question", 0)
+    If X <> 1 Then System
+End Sub
+
+Sub InstallImageMagick
+    Dim HomePage$
+    Dim X As Integer
+    Dim USE_WINGET As Integer
+    $If WINDOWS Then
+        MM_Nop
+        If IsInstalled("WINGET") Then
+            USE_WINGET = _MessageBox("USE WINGET ? ", "Install ImageMagick with WINGET ?", "yesno", "question", 0)
+            If USE_WINGET = 1 Then
+                Shell ("CMD /C winget install -e  --id ImageMagick.ImageMagick")
+            End If
+            If USE_WINGET And IsInstalled("magick") Then
+                GoTo DONEWINDOWS
+            End If
+        End If
+    $End If
+
+
+    HomePage$ = "https://www.imagemagick.org"
+    X = _MessageBox("Open ImageMagick Home Page", "Missing ImageMagick." + CRLF + "      (Required)" + CRLF + "Do You want to Open the ImageMagick Home Page ?", "yesno", "question", 0)
+    If X = 1 Then Shell SystemOpen$ + HomePage$
+
+    $If WINDOWS Then
+        Dim J As Integer
+        If X = 1 Then INFO_DIALOG "RECOMMENDED VERSION", "Recommended Version is 8 bits per color channel" + CRLF + "Win64 static", "info"
+        J = _MessageBox("Attempt Direct Download of ImageMagick Installer ", "Do You want to download ImageMagick Now ?", "yesno", "question", 0)
+        If J = 1 Then
+            X = _MessageBox("Attempt Download of source #1", "Do You want to download from " + CRLF + "ImageMagick.ORG", "yesno", "question", 0)
+            If X = 1 Then Shell ("start  https://imagemagick.org/archive/binaries/ImageMagick-7.1.1-47-Q8-x64-static.exe")
+            If X = 1 Then GoTo FinishMInstall
+        End If
+
+        If J = 1 Then
+            X = _MessageBox("Attempt Direct Download Source 2 ", "Do You want to download ImageMagick Version 6" + CRLF + "(Cached on the X16 Forum)", "yesno", "question", 0)
+            If X = 1 Then Shell ("start  https://cx16forum.com/forum/download/file.php?id=2469")
+            GoTo FinishMInstall
+        End If
+        DONEWINDOWS:
+    $End If
+
+    $If LINUX Then
+        If IsInstalled("apt") Then
+            X = _MessageBox("Install with apt", "Attempt ImageMagick install with apt ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("apt install imagemagick -y")
+                GoTo FinishMInstall
+            End If
+        End If
+        If IsInstalled("yum") Then
+            X = _MessageBox("Install with Yum", "Attempt ImageMagick install with Yum ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("yum install imagemagick")
+                GoTo FinishMInstall
+            End If
+        End If
+        If IsInstalled("brew") Then
+            X = _MessageBox("Install with Brew", "Attempt ImageMagick install with HomeBrew ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("brew install imagemagick")
+                GoTo FinishMInstall
+            End If
+        End If
+    $End If
+
+    $If MAC Then
+        If IsInstalled("brew") Then
+            X = _MessageBox("Install with Brew", "Attempt ImageMagick install with HomeBrew ?" + CRLF + "(Must have a visible console Window)", "yesno", "question", 0)
+            If X = 1 Then
+                Shell ("brew install imagemagick")
+                GoTo FinishMInstall
+            End If
+        End If
+    $End If
+
+    FinishMInstall:
+    X = _MessageBox("X16 Movie Maker ", "Continue Opening X16 Movie Maker ? " + CRLF + "(If you have installed the ImageMagick package.)", "yesno", "question", 0)
+    If X <> 1 Then System
+    $If WINDOWS Then
+        MM_Nop
+    $End If
+End Sub
+
+Sub DualPrint (Text$)
+    MM_DestScr
+    Print Text$
+    _Dest _Console
+    Print Text$
+End Sub
+
+Function Video_IS_NORMAL%
+    Video_IS_NORMAL = (Src_Aspect >= 1.2) _AndAlso (Src_Aspect < 1.5)
+End Function
+
+Sub ErrorHalt (msg$)
+    INFO_DIALOG "Movie Maker Error", msg$, "error"
+    System
+End Sub
+
+Sub CREATE_PALETTE_BMP (BF_NAME$, NORMAL_PALETTE As Integer)
+    If GetFileExt(BF_NAME$) = "" Then
+        BF_NAME$ = BF_NAME$ + ".BMP"
+    End If
+
+    Dim PALHEADER As BMPHeaderType
+    Dim I As Long
+    Dim R As _Unsigned _Byte
+    Dim G As _Unsigned _Byte
+    Dim B As _Unsigned _Byte
+    Dim Pixel As _Unsigned _Byte
+    Dim PixBase As _Unsigned _Byte
+    Dim Y As Integer
+    Dim X As Integer
+    Dim C As Long
+    Dim LINES As Integer
+    Dim tmp$
+    Dim P_LFN As Long
+
+    PALHEADER.id = "BM"
+    PALHEADER.rr1 = 0
+    PALHEADER.rr2 = 0
+    PALHEADER.wid = 320
+    PALHEADER.hei = 320
+    PALHEADER.horz = 40
+    PALHEADER.size = (320 * 320) + Len(PALHEADER)
+    PALHEADER.imagebytes = 320 * 320
+    PALHEADER.offset = Len(PALHEADER)
+    PALHEADER.planes = 1
+    PALHEADER.bpp = 8
+    PALHEADER.pakbyte = 0
+    PALHEADER.xres = 2835
+    PALHEADER.yres = 2835
+    PALHEADER.colch = 256
+    PALHEADER.ic = 256
+
+    tmp$ = ""
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    If NORMAL_PALETTE Then
+        For I = 0 To 255
+            G = _Green32(ImagePalette(I))
+            B = _Blue32(ImagePalette(I))
+            R = _Red32(ImagePalette(I))
+            tmp$ = tmp$ + Chr$(B) + Chr$(G) + Chr$(R) + Chr$(255)
+        Next
+    Else
+        For I = 0 To EXT_UPPER_COLOR
+            G = _Green32(TARGET_PAL_FOR_MAPPING(I))
+            B = _Blue32(TARGET_PAL_FOR_MAPPING(I))
+            R = _Red32(TARGET_PAL_FOR_MAPPING(I))
+            tmp$ = tmp$ + Chr$(B) + Chr$(G) + Chr$(R) + Chr$(255)
+        Next
+    End If
+
+    If EXT_UPPER_COLOR < 255 Then
+        For I = EXT_UPPER_COLOR + 1 To 255
+            G = _Green32(VERA_DEFAULT_PALETTE_EXPANDED(I))
+            B = _Blue32(VERA_DEFAULT_PALETTE_EXPANDED(I))
+            R = _Red32(VERA_DEFAULT_PALETTE_EXPANDED(I))
+            tmp$ = tmp$ + Chr$(B) + Chr$(G) + Chr$(R) + Chr$(255)
+        Next
+    End If
+
+    PALHEADER.pal = tmp$
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+
+    If _FileExists(BF_NAME$) Then Kill BF_NAME$
+
+    P_LFN = FreeFile
+    Open BF_NAME$ For Binary As P_LFN
+
+    Put P_LFN, , PALHEADER
+
+    PixBase = &HF0
+    For Y = 0 To 15
+        For LINES = 0 To 19
+            For X = 0 To 15
+                Pixel = PixBase + X
+                For C = 0 To 19
+                    Put P_LFN, , Pixel
+                Next
+            Next
+        Next
+        PixBase = PixBase - 16
+    Next
+    Close P_LFN
+End Sub
+
+Sub CREATE_AVERAGED_PALETTE
+    Dim SAMPLENUMS(0 To 29) As Long
+    Dim SAMPLEFILES$(0 To 29)
+    Dim suffix$
+    Dim CMD$
+    Dim ALLDONE As Integer
+    Dim I As Long
+    Dim J As Long
+    Dim rAdder As Long
+    Dim rMult As Long
+    I = 0
+    ALLDONE = _FALSE
+    MM_DestScr
+    Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+    Cls
+    Print
+    Tprint "  {GRAY 1} Starting Palette Averaging{LIGHT RED}.......{13}{13}"
+
+    rMult = FrameCount * (1 / 3)
+    rAdder = 1
+    Do
+        GET_ANOTHER_NUMBER:
+        SAMPLENUMS(I) = Int(Rnd(1) * rMult) + rAdder
+        If I > 1 Then
+            For J = 1 To I - 1
+                If SAMPLENUMS(I) = SAMPLENUMS(J) GoTo GET_ANOTHER_NUMBER
+            Next
+        End If
+        I = I + 1
+        If I = 4 Then
+            rAdder = rMult
+        End If
+        If I = 9 Then
+            rAdder = (rAdder + rMult) - 1
+        End If
+        ALLDONE = (I > 14)
+    Loop Until ALLDONE
+    Print
+    For I = 0 To 14
+        If SAMPLENUMS(I) < 10 Then
+            suffix$ = "0000000"
+            GoTo MAKESAMPLENAME
+        End If
+        If SAMPLENUMS(I) > 9 _AndAlso SAMPLENUMS(I) < 100 Then
+            suffix$ = "000000"
+            GoTo MAKESAMPLENAME
+        End If
+        If SAMPLENUMS(I) > 99 _AndAlso SAMPLENUMS(I) < 1000 Then
+            suffix$ = "00000"
+            GoTo MAKESAMPLENAME
+        End If
+        If SAMPLENUMS(I) > 999 _AndAlso SAMPLENUMS(I) < 10000 Then
+            suffix$ = "0000"
+            GoTo MAKESAMPLENAME
+        End If
+        If SAMPLENUMS(I) > 9999 _AndAlso SAMPLENUMS(I) < 100000 Then
+            suffix$ = "000"
+            GoTo MAKESAMPLENAME
+        End If
+        If SAMPLENUMS(I) > 99999 Then suffix$ = "00"
+        MAKESAMPLENAME:
+        SAMPLEFILES$(I) = suffix$ + Mid$(Str$(SAMPLENUMS(I)), 2) + FrameExt$
+        Tprint "{WHT} USING{GRN}: {LIGHT RED}" + SAMPLEFILES$(I) + "{13}"
+    Next
+    Print
+    CMD$ = Magick$
+
+    For I = 0 To 14
+        CMD$ = CMD$ + Chr$(32) + SAMPLEFILES$(I)
+    Next
+
+    If _FileExists("outcolor.bmp") Then Kill "outcolor.bmp"
+
+    CMD$ = CMD$ + " +append -colors " + UsedCols$ + " -type palette BMP3:outcolor.bmp"
+
+    Tprint " {WHT}EXECUTING{GRN}: {LIGHT GREEN}"
+    Print CMD$
+    Print
+    Shell CMD$
+End Sub
+
+Sub KILL_EXTRACTION
+    ' Stops a running ffmpeg without needing its process id.
+    $If WINDOWS Then
+        Shell _Hide "taskkill /F /IM ffmpeg.exe >nul 2>&1"
+    $Else
+        Shell _Hide "killall ffmpeg >/dev/null 2>&1 || pkill ffmpeg >/dev/null 2>&1"
+    $End If
+End Sub
+
+Sub EXTRACT_CANCEL_CHECK (SubTitle$)
+    ' Called from the ffmpeg wait loops: honors the Cancel button while frames
+    ' or audio are being extracted.
+    Dim TMP_AF$
+    Dim SavedDest As Long, SavedSource As Long
+    If Not MM_CANCEL Then Exit Sub
+    MM_CANCEL = _FALSE
+    ' the dialog runs the form's event loop, which leaves _Dest/_Source pointing
+    ' elsewhere: remember them so the ffmpeg screen keeps updating after "No"
+    SavedDest = _Dest
+    SavedSource = _Source
+    If Not GotYES("CANCEL CONVERSION", "Cancel this conversion ?" + CRLF + CRLF + "ffmpeg will be stopped.", _FALSE) Then
+        _Dest SavedDest
+        _Source SavedSource
+        MM_Show
+        Exit Sub
+    End If
+    _Dest SavedDest
+    _Source SavedSource
+    KILL_EXTRACTION
+    MM_Delay 1
+    SAFE_KILL "ffmpeg-out.dat"
+    SAFE_KILL "audio.out"
+    SAFE_KILL ".." + Slash$ + "audio.out"
+    If Wipe_TMP_Files Then
+        If _DirExists("frames") Then
+            DIALOG_THEME.MSG_BG = _RGB32(125, 0, 0)
+            DIALOG_THEME.MSG_FG = _RGB32(50, 255, 0)
+            If GotYES("REMOVE FRAMES", "Remove the extracted Frames ?", _TRUE) Then
+                Shell NukeDir$ + "frames"
+                TMP_AF$ = BARE_CWD$
+                DIALOG_THEME.MSG_BG = _RGB32(0, 0, 110)
+                DIALOG_THEME.MSG_FG = _RGB32(255, 255, 255)
+                ChDir ".."
+                Shell _Hide "rmdir " + Chr$(34) + TMP_AF$ + Chr$(34) + " 2>" + NULL$
+            Else
+                DIALOG_THEME.MSG_BG = _RGB32(0, 0, 110)
+                DIALOG_THEME.MSG_FG = _RGB32(255, 255, 255)
+            End If
+        End If
+    End If
+    EXIT_MOVIEMAKER
+End Sub
+
+Sub RUN_FFMPEG (FCmd$, SubTitle$, HALT_ON_ERROR As Integer)
+    Dim PrevFFSCR As Integer
+    Dim SAVE_SCREEN As Long
+    Dim frame$
+    Dim progress$
+    Dim speed$
+    Dim fps$
+    Dim vidtime$
+    Dim YLoc As Integer
+    Dim YAfter As Integer
+
+    Dim Cm1$
+    Dim Cm2$
+    Dim Cm3$
+    Dim Cm4$
+    Dim QuoteOpen As Integer
+    Dim GotName As Integer
+
+    Dim LASTPOS As _Unsigned Long
+    Dim DotString$
+    Dim Col$
+    Dim DCol As Integer
+    Dim INS$
+    Dim L As Integer
+    Dim L2 As Integer
+    Dim I As Integer
+    Dim LCOUNT As _Unsigned _Integer64
+    FFMPEG_ERROR = _FALSE
+    MM_IN_FFMPEG = _TRUE
+    SAVE_SCREEN = _CopyImage(MM_SCR)
+    PrevFFSCR = MM_FFSCR
+    MM_FFSCR = _TRUE
+    PROG_HEADER "X16 Movie Maker - Running FFMPEG"
+    If _FileExists("ffmpeg-out.dat") Then Kill "ffmpeg-out.dat"
+    $If WINDOWS Then
+        Shell _DontWait _Hide FCmd$ + " -progress ffmpeg-out.dat"
+    $Else
+        Shell _DontWait FCmd$ + " -progress ffmpeg-out.dat"
+    $End If
+    I = 1
+    Do
+        Cm2$ = Cm3$
+        Cm3$ = Mid$(FCmd$, I, 1)
+        I = I + 1
+    Loop Until Cm3$ = "i" And Cm2$ = "-"
+
+    Cm2$ = Mid$(FCmd$, I)
+    Cm2$ = _Trim$(Cm2$)
+
+    QuoteOpen = (Asc(Cm2$) = 34)
+
+    L = Len(Cm2$)
+
+    Cm4$ = ""
+    Do
+        Cm3$ = Mid$(Cm2$, L, 1)
+        If Asc(Cm3$) <> 32 Then Cm4$ = Cm3$ + Cm4$
+        L = L - 1
+    Loop Until Cm3$ = Chr$(32)
+    L = Len(Cm2$)
+    L2 = Len(Cm4$)
+    Cm2$ = _Trim$(Left$(Cm2$, L - L2))
+    I = 1
+    GotName = _FALSE
+    Cm1$ = ""
+    Do
+        Cm3$ = Mid$(Cm2$, I, 1)
+        If (Asc(Cm3$) <> 32) Or QuoteOpen Then Cm1$ = Cm1$ + Cm3$
+        If QuoteOpen Then
+            GotName = ((I > 1) And (Asc(Cm3$) = 34))
+        Else
+            GotName = ((I > 1) And (Asc(Cm3$) = 32))
+        End If
+        I = I + 1
+    Loop Until GotName
+    L = Len(Cm2$)
+    L2 = Len(Cm1$)
+    Cm2$ = _Trim$(Right$(Cm2$, L - L2))
+
+    DotString$ = "."
+    Col$ = "{LIGHT RED}"
+    Do
+        Locate 9, 10
+        DCol = DCol + 1
+        If DCol > 15 Then DCol = 0
+        Col$ = "{" + CString(DCol) + "}"
+        Tprint " {WHT}Waiting" + Col$ + DotString$ + "          "
+        DotString$ = DotString$ + "."
+        If DotString$ = "......." Then
+            DotString$ = "."
+        End If
+        MM_Show
+        EXTRACT_CANCEL_CHECK SubTitle$
+        _Limit 20
+    Loop Until _FileExists("ffmpeg-out.dat")
+    Locate 9, 4
+    Tprint "{YEL}ffmpeg {WHT}-i {LIGHT GREEN}" + Cm1$ + " {GRN}" + Cm2$ + " {LIGHT RED}" + Cm4$
+    YAfter = CsrLin + 2
+    ' Tprint "{CYAN}" + FCmd$
+
+    DotString$ = "."
+    Do
+        LCOUNT = LCOUNT + 1
+        Locate YAfter, 12
+        Tprint "  {YEL}" + SubTitle$ + "{LIGHT GREEN}  Check status pass{GRN}: {YEL}#{WHT}" + _Trim$(Str$(LCOUNT))
+        Open "ffmpeg-out.dat" For Input As 9
+        If LCOUNT > 100 And LOF(9) = 0 Then
+            Close 9
+            If _FileExists("ffmpeg-out.dat") Then Kill "ffmpeg-out.dat"
+            If HALT_ON_ERROR Then
+                INFO_DIALOG "FFMPEG ERROR", "FFMPEG ENCOUNTERED AN ERROR EXECUTING:" + CRLF + CRLF + FCmd$, "ERROR"
+                EXIT_MOVIEMAKER
+            Else
+                If GotYES("FFMEG ERROR", "ERROR EXECUTING" + CRLF + CRLF + FCmd$ + CRLF + CRLF + "Continue ?", _TRUE) Then
+                    FFMPEG_ERROR = _TRUE
+                    MM_FFSCR = PrevFFSCR
+                    MM_IN_FFMPEG = _FALSE
+                    Exit Sub
+                Else
+                    EXIT_MOVIEMAKER
+                End If
+            End If
+        End If
+        If LOF(9) > 0 Then
+            Seek 9, LASTPOS + 1
+            Do
+                GoSub GETNEXTLINE
+            Loop Until EOF(9)
+            LASTPOS = Loc(9)
+        End If
+        Close 9
+        GoSub PRINT_FSTATUS
+        MM_Show
+        EXTRACT_CANCEL_CHECK SubTitle$
+        _Limit 30
+    Loop Until progress$ = "end"
+
+    Locate 25, 42
+    Tprint "{LIGHT GREEN} DONE{WHT}......{LIGHT RED}!!"
+    MM_Delay 2.5
+    If _FileExists("ffmpeg-out.dat") Then Kill "ffmpeg-out.dat"
+    _PutImage , SAVE_SCREEN, MY_DISPLAY
+    _FreeImage SAVE_SCREEN
+    MM_FFSCR = PrevFFSCR
+    MM_IN_FFMPEG = _FALSE
+    Exit Sub
+
+    GETNEXTLINE:
+    Line Input #9, INS$
+    PARSE_INFO INS$
+    Select Case LEFT_PARSE$
+        Case "progress"
+            progress$ = RIGHT_PARSE$
+        Case "frame"
+            frame$ = RIGHT_PARSE$
+        Case "speed"
+            speed$ = RIGHT_PARSE$
+        Case "fps"
+            fps$ = RIGHT_PARSE$
+        Case "out_time"
+            vidtime$ = RIGHT_PARSE$
+        Case Else
+            ' Nothing
+    End Select
+    Return
+
+    PRINT_FSTATUS:
+    YLoc = YAfter + 2
+    If Len(frame$) > 0 Then
+        Locate YLoc, 58
+        Tprint "{WHT} Frame{RED}: {LIGHT GREEN}" + frame$
+        YLoc = YLoc + 2
+    End If
+
+    If Len(vidtime$) > 0 Then
+        Locate YLoc, 58
+        Tprint "{WHT}  Time{RED}: {LIGHT GREEN}" + vidtime$ + "     "
+        YLoc = YLoc + 2
+    End If
+
+    If Len(speed$) > 0 Then
+        Locate YLoc, 58
+        Tprint "{WHT} Speed{RED}: {LIGHT GREEN}" + speed$ + "     "
+        YLoc = YLoc + 2
+    End If
+
+    If Len(fps$) > 0 Then
+        Locate YLoc, 58
+        Tprint "{WHT}   FPS{RED}: {LIGHT GREEN}" + fps$ + "      "
+    End If
+
+    If Len(progress$) > 0 Then
+        Locate 25, 45
+        Tprint "{WHT}Working{RED}:" + Col$ + DotString$ + "          "
+        DotString$ = DotString$ + "."
+        If DotString$ = "........" Then
+            DotString$ = "."
+            If Col$ = "{LIGHT RED}" Then
+                Col$ = "{LIGHT GREEN}"
+            Else
+                Col$ = "{LIGHT RED}"
+            End If
+        End If
+    End If
+    Return
+End Sub
+
+Sub PARSE_INFO (PARSTR$)
+    Dim L As Long
+    Dim MP As Integer
+    Dim TMP$
+    TMP$ = _Trim$(PARSTR$)
+    L = Len(TMP$)
+    MP = InStr(TMP$, "=")
+    If MP = 0 Then
+        LEFT_PARSE$ = TMP$
+        RIGHT_PARSE$ = ""
+    Else
+        LEFT_PARSE$ = Left$(TMP$, MP - 1)
+        RIGHT_PARSE$ = Right$(TMP$, L - MP)
+    End If
+End Sub
+
+Sub CHOOSE_A_VIDEOFILE
+    Dim VExtensions$
+    VExtensions$ = "*.mpg|*.MPG|*.mpeg|*.MPEG|*.MP4|*.mp4|*.mkv|*.MKV|*.avi|*.AVI|*.mov|*.MOV|*.M4V|*.m4v|*.webm|*.WEBM"
+    TName$ = _OpenFileDialog$("X16 Movie Maker - Select Video File to Convert", "", VExtensions$, "Movie Files", 0)
+    If TName$ = "" Then Exit Sub
+    SUCCESS = _TRUE
+    VIDEO_IS_PICKED = _TRUE
+    NEW_VIDEO_PROJECT = _TRUE
+    USE_EXISTING_FRAMEFOLDER = _FALSE
+    GetSource_Parameters (TName$)
+    DName$ = TName$
+End Sub
+
+Function GET_FRAME_INFO%
+    Dim tmp$
+    Dim i As Long
+    Dim PCOUNT As Integer
+    PCOUNT = 0
+    If _FileExists("frames.data") Then
+        Open "frames.data" For Input As 17
+        For i = 1 To 3
+            Line Input #17, tmp$
+            PARSE_INFO tmp$
+            Select Case LEFT_PARSE$
+                Case "FPS"
+                    MovieFPS$ = _Trim$(RIGHT_PARSE$)
+                    PCOUNT = PCOUNT + 1
+                Case "VBYTE"
+                    VERA_RATE = Val(_Trim$(RIGHT_PARSE$))
+                    PCOUNT = PCOUNT + 1
+                Case "AFRAME"
+                    Audio_FrameSize = Val(_Trim$(RIGHT_PARSE$))
+                    PCOUNT = PCOUNT + 1
+            End Select
+        Next
+        Close 17
+    End If
+    SUCCESS = (PCOUNT = 3)
+    GET_FRAME_INFO = SUCCESS
+End Function
+
+Function GET_FILESIZE&& (TFile$)
+    Dim tmp As _Unsigned _Integer64
+    If Not _FileExists(TFile$) Then
+        tmp = 0
+    Else
+        Open TFile$ For Binary As #21
+        tmp = LOF(21)
+        Close 21
+    End If
+    GET_FILESIZE = tmp
+End Function
+
+Sub SwapPaletteColors (UsedIndx As Integer, FreeIndx As Integer)
+    Static VPalTmp As VPALTYPE
+    Static PalL As Long
+    Static TmpVGA As VGAPAL_TYPE
+    Dim I As Long
+
+    ' Save the Used Indice Palette Color
+    VPalTmp = VERAPAL(UsedIndx) ' Image 12 bit VERA Palette
+    PalL = ImagePalette(UsedIndx) ' Preview Image 32 bit translated palette color
+    If FOR_VGA Or FULL_24BIT_PALETTE Then
+        TmpVGA = VGA_PALETTE(UsedIndx)
+    End If
+
+    ' Free the Used Index and copy the VERA Default Value to it.
+    VERAPAL(UsedIndx) = VERAPALDEFAULT(UsedIndx)
+    ImagePalette(UsedIndx) = VERA_DEFAULT_PALETTE_EXPANDED(UsedIndx)
+
+    If FOR_VGA Or FULL_24BIT_PALETTE Then
+        VGA_PALETTE(UsedIndx) = VGA_PALETTE(FreeIndx)
+        VGA_PALETTE(FreeIndx) = TmpVGA
+    End If
+
+    VERAPAL(FreeIndx) = VPalTmp
+    ImagePalette(FreeIndx) = PalL
+    COLOR_IS_USED(FreeIndx) = _TRUE
+    COLOR_IS_USED(UsedIndx) = _FALSE
+
+    ' Remember the Used -> Free index change.  The pixels are rewritten in
+    ' ONE pass by SHIFT_THE_PALETTE once all of the swaps are known.
+    If Not SWAP_PENDING Then
+        For I = 0 To 255
+            SWAP_REMAP(I) = I
+        Next
+        SWAP_PENDING = _TRUE
+    End If
+    SWAP_REMAP(UsedIndx) = FreeIndx
+End Sub
+
+Sub SWAPIN_IMMORTAL_PALETTE
+    Dim I As Long
+    Restore IMMORTAL_PALETTE
+    For I = 0 To 255
+        Read VERAPALDEFAULT(I).GB
+        Read VERAPALDEFAULT(I).R
+        VERA_DEFAULT_PALETTE_EXPANDED(I) = VERA2RGB(VERAPALDEFAULT(I))
+        WorkingPAL(I) = VERAPALDEFAULT(I)
+    Next
+End Sub
+
+Sub LOAD_VERA_DEFAULTPALETTES
+    Dim I As Long
+    Restore VERA_DEFAULT
+    For I = 0 To 255
+        Read VERAPALDEFAULT(I).GB
+        Read VERAPALDEFAULT(I).R
+        VERA_DEFAULT_PALETTE_EXPANDED(I) = VERA2RGB(VERAPALDEFAULT(I))
+        WorkingPAL(I) = VERAPALDEFAULT(I)
+    Next
+
+    Restore VERA_GRAY
+    For I = 0 To 15
+        Read VERA_DEF_GRAY(I).GB
+        Read VERA_DEF_GRAY(I).R
+    Next
+End Sub
+
+Function HighestPalFree%
+    Dim I As Integer
+    Dim R As Integer
+    Dim GOTIT As Integer
+    I = 255
+    Do
+        If Not COLOR_IS_USED(I) Then
+            GOTIT = _TRUE
+            R = I
+            Exit Do
+        End If
+        I = I - 1
+    Loop Until I < 0
+    If GOTIT Then
+        HighestPalFree = R
+    Else
+        HighestPalFree = -2
+    End If
+End Function
+
+Function BARE_CWD$
+    Dim temp$, temp2$
+    Dim I As Long
+    temp$ = _CWD$
+    I = Len(temp$)
+    If Mid$(temp$, I, 1) = "/" Or Mid$(temp$, I, 1) = "\" Then I = I - 1
+    Do
+        If I = 0 Then Exit Do
+        temp2$ = Mid$(temp$, I, 1) + temp2$
+        I = I - 1
+        If I = 0 Then Exit Do
+    Loop Until (Mid$(temp$, I, 1) = "/" Or Mid$(temp$, I, 1) = "\")
+    BARE_CWD = temp2$
+End Function
+
+Sub ABOUT
+    Dim AboutMsg$
+    Y_ADJUSTOR = -50
+    AboutMsg$ = "Commander X16 Movie Maker" + CRLF
+    AboutMsg$ = AboutMsg$ + "Version " + MM_VERSION$ + CRLF + CRLF
+    AboutMsg$ = AboutMsg$ + "An application to create X16 playable videos." + CRLF
+    AboutMsg$ = AboutMsg$ + "from standard desktop formats.  (.mp4,.avi,.mov..etc...)" + CRLF + CRLF
+    AboutMsg$ = AboutMsg$ + "AUTHOR: Anthony W. Henry" + CRLF
+    AboutMsg$ = AboutMsg$ + "        (c) 2026 " + CRLF + CRLF
+    AboutMsg$ = AboutMsg$ + "Distributed under the MIT no attribution license" + CRLF
+    AboutMsg$ = AboutMsg$ + "https://opensource.org/license/mit-0"
+    INFO_DIALOG "ABOUT X16 Movie Maker", AboutMsg$, "info"
+End Sub
+
+Sub ShowLicense
+    Dim LicenseMSG$
+    ' Y_ADJUSTOR = -55
+    Y_ADJUSTOR = -20
+    LicenseMSG$ = "Copyright 2026, Anthony W. Henry" + CRLF + CRLF
+    LicenseMSG$ = LicenseMSG$ + "Permission is hereby granted, free of charge, to any person obtaining a copy" + CRLF
+    LicenseMSG$ = LicenseMSG$ + "of this software and associated documentation files (the Software), to deal" + CRLF
+    LicenseMSG$ = LicenseMSG$ + "in the Software without restriction, including without limitation the" + CRLF
+    LicenseMSG$ = LicenseMSG$ + "the rights to use, copy, modify, merge, publish, distribute, sublicense," + CRLF
+    LicenseMSG$ = LicenseMSG$ + "and/or sell copies of the Software, and to permit persons to whom the" + CRLF
+    LicenseMSG$ = LicenseMSG$ + "software is furnished to do so." + CRLF + CRLF
+
+    LicenseMSG$ = LicenseMSG$ + "THE SOFTWARE IS PROVIDED  AS IS, WITHOUT WARRANTY OF ANY KIND, EXPRESS " + CRLF
+    LicenseMSG$ = LicenseMSG$ + "OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY," + CRLF
+    LicenseMSG$ = LicenseMSG$ + "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE " + CRLF
+    LicenseMSG$ = LicenseMSG$ + "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER " + CRLF
+    LicenseMSG$ = LicenseMSG$ + "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM," + CRLF
+    LicenseMSG$ = LicenseMSG$ + "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS " + CRLF
+    LicenseMSG$ = LicenseMSG$ + "IN THE SOFTWARE." + CRLF
+    INFO_DIALOG "X16 Movie Maker - License", LicenseMSG$, "info"
+End Sub
+
+Function COMMODORE_FRIENDLY_NAME$ (OLDNAME$)
+    Dim TMP$
+    Dim TMPS$
+    Dim LSTR$
+    Dim RSTR$
+    Dim C As String * 1
+    Dim A As Integer
+    Dim I As Long
+    TMPS$ = UCase$(OLDNAME$)
+    If FOR_VGA Then
+        TMP$ = _Trim$(Left$(GetFileName(OLDNAME$), 8))
+        TMP$ = TMP$ + GetFileExt(OLDNAME$)
+        GoTo FDONE
+    End If
+    For I = 1 To Len(TMPS$)
+        C = Mid$(TMPS$, I, 1)
+        If C = "_" Then C = "-"
+        If C = "?" Or C = "*" Or C = "|" Then _Continue
+        A = Asc(C)
+        If A > 31 And A < 128 Then
+            TMP$ = TMP$ + C
+        End If
+        If Len(TMP$) > 17 And InStr(TMP$, ".") = 0 Then
+            While Len(TMP$) > 0 _AndAlso Right$(TMP$, 1) = Chr$(32)
+                TMP$ = Left$(TMP$, Len(TMP$) - 1)
+            Wend
+            If Len(TMP$) > 12 Then
+                TMP$ = TMP$ + GetFileExt(TMPS$)
+                Exit For
+            End If
+        End If
+    Next
+    FDONE:
+    If FOR_VGA Then
+        Do
+            I = InStr(TMP$, Chr$(32))
+            If I > 0 Then
+                Mid$(TMP$, I, 1) = "-"
+            End If
+        Loop Until I = 0
+    End If
+    COMMODORE_FRIENDLY_NAME$ = TMP$
+End Function
+
+Function FILE_LENGTH~&& (FNAME$)
+    Dim TMP~&&
+    Dim TLFN As Long
+    If _FileExists(FNAME$) Then
+        TLFN = FreeFile
+        Open FNAME$ For Binary As TLFN
+        TMP~&& = LOF(TLFN)
+        Close TLFN
+    Else
+        TMP~&& = 0
+    End If
+    FILE_LENGTH = TMP~&&
+End Function
+
+Sub COUT (S$)
+    Dim H As Long
+    H = _Dest
+    _Dest _Console
+    Print S$
+    _Dest H
+End Sub
+
+
+' Error handler for SAFE_KILL (QB64 wants the handler label at module level).
+' This file is included after InForm's main loop, so this code is only ever reached by an error.
+KILLFAILED:
+SAFEKILL_FAILED = _TRUE
+Resume Next

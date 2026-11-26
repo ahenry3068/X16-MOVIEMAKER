@@ -1,0 +1,587 @@
+' MM_CALC.BM -- reads the form, works out the video settings, keeps the form consistent.
+' Nothing in here changes the converter's state: MM_Calc only fills the M_ variables.
+
+' ---------------------------------------------------------------------------------
+'  Pure helpers (no engine globals)
+' ---------------------------------------------------------------------------------
+Function MM_SprW% (W As Long)
+    If W Mod 64 = 0 Then MM_SprW = 64: Exit Function
+    If W Mod 32 = 0 Then MM_SprW = 32: Exit Function
+    MM_SprW = 16
+End Function
+
+Function MM_SprH% (H As Long)
+    If H Mod 64 = 0 Then MM_SprH = 64: Exit Function
+    If H Mod 32 = 0 Then MM_SprH = 32: Exit Function
+    If H Mod 16 = 0 Then MM_SprH = 16: Exit Function
+    MM_SprH = 8
+End Function
+
+Function MM_BitDiv% (bits As Integer)
+    Select Case bits
+        Case 1: MM_BitDiv = 8
+        Case 2: MM_BitDiv = 4
+        Case 4: MM_BitDiv = 2
+        Case Else: MM_BitDiv = 1
+    End Select
+End Function
+
+' the default frame rate of GetDefaultFRM_Rate, worked out from plain values
+Function MM_RateFor$ (w As Long, h As Long, bits As Integer, sector As Integer, bitmapMode As Integer, make4 As Integer, desktopOnly As Integer)
+    Dim defv As Long
+    Dim adj As Double
+    Dim tmax As Double
+    Dim tr As Double
+    If sector Then tmax = 800000 Else tmax = 180000
+    defv = 15
+    If NO_LIMITS And bitmapMode Then defv = 24
+    adj = 1
+    If make4 Then adj = .5
+    If bitmapMode Then
+        Select Case bits
+            Case 8: adj = 1
+            Case 4: adj = .5
+            Case 2: adj = .25
+            Case 1: adj = .125
+        End Select
+    End If
+    Do
+        tr = defv * h * w * adj
+        If (tr > tmax) And (Not desktopOnly) And defv > 1 Then
+            defv = defv - 1
+        Else
+            Exit Do
+        End If
+    Loop
+    MM_RateFor = _Trim$(Str$(defv))
+End Function
+
+' the default of the old frame rate prompt for sector aligned frames
+Function MM_SectorRate$ (w As Long, h As Long, bits As Integer, isVGA As Integer)
+    Dim fb As Double, fr As Double
+    Dim T As Long
+    If isVGA Then MM_SectorRate = "12.5": Exit Function
+    fb = (h * w) / MM_BitDiv(bits)
+    Do While (fb - Int(fb / 512) * 512) <> 0
+        fb = fb + 1
+    Loop
+    fr = 730000 / fb
+    fr = Int(fr * 10) / 10
+    If fr > 45 Then fr = 45
+    T = Int(fr)
+    If (T + .5) > fr Then
+        fr = (T - 1) + .5
+    ElseIf fr > (T + .6) Then
+        fr = T + .5
+    End If
+    MM_SectorRate = _Trim$(Str$(fr))
+End Function
+
+' ---------------------------------------------------------------------------------
+'  Audio frame choices (sector aligned and Amiga videos)
+' ---------------------------------------------------------------------------------
+Sub MM_BuildAudioChoices (kind As Integer, fps As Double, as16 As Integer, stereo As Integer)
+    Dim I As Integer, N As Integer
+    Dim ach(1 To 8) As Double, sr(1 To 8) As Double
+    Dim adiv As Double, tr As Double
+    Dim minlim As Integer, toplim As Integer, toprate As Integer
+    Dim st As Integer
+    Dim clock As Double
+    Dim want(1 To 6) As Double
+    Dim per As Long, rate As Double, af As Long
+    MM_ANUM = 0: MM_ADEF = 1: MM_AFORCE_STEREO = _FALSE
+    If fps < 1 Then fps = 15
+    If kind = 2 Then
+        If AMIGA_PAL Then clock = AMI_CLOCK_PAL# Else clock = AMI_CLOCK_NTSC#
+        want(1) = 8000: want(2) = 11025: want(3) = 16000: want(4) = 22050: want(5) = 24000: want(6) = 28000
+        For I = 1 To 6
+            per = _Round(clock / want(I))
+            If per < AMI_MIN_PERIOD Then per = AMI_MIN_PERIOD
+            rate = clock / per
+            af = _Round(rate / fps)
+            af = (af \ 2) * 2
+            If af < 2 Then af = 2
+            MM_ANUM = MM_ANUM + 1
+            MM_AFRAME(MM_ANUM) = af
+            MM_ARATE(MM_ANUM) = rate
+            MM_APERIOD(MM_ANUM) = per
+            MM_AIDX(MM_ANUM) = I
+        Next
+        MM_ADEF = 4
+        Exit Sub
+    End If
+    st = stereo
+    Do
+        If fps > 30 Then ach(1) = 512: toplim = 6 Else ach(1) = 1024: toplim = 5
+        adiv = 1
+        If as16 Then adiv = adiv * 2
+        If st Then adiv = adiv * 2
+        sr(1) = ach(1) * fps / adiv
+        minlim = 1
+        If sr(1) < 6000 Then minlim = 2
+        toprate = -2
+        For I = 2 To toplim
+            ach(I) = ach(I - 1) + 512
+            tr = (ach(I) * fps) / adiv
+            tr = (_Round(tr * 100)) / 100
+            If tr < 48828 Then
+                sr(I) = tr
+                If sr(I) < 6000 Then minlim = I + 1
+                toprate = I
+            End If
+        Next
+        If toprate = -2 Then
+            If st Then Exit Do
+            st = _TRUE
+            MM_AFORCE_STEREO = _TRUE
+        Else
+            Exit Do
+        End If
+    Loop
+    If toprate = -2 Then
+        ' nothing usable: fall back to the first size so the form still has an entry
+        MM_ANUM = 1: MM_AFRAME(1) = ach(1): MM_ARATE(1) = sr(1): MM_AIDX(1) = 1: MM_ADEF = 1
+        Exit Sub
+    End If
+    For I = minlim To toprate
+        MM_ANUM = MM_ANUM + 1
+        MM_AFRAME(MM_ANUM) = ach(I)
+        MM_ARATE(MM_ANUM) = sr(I)
+        MM_AIDX(MM_ANUM) = I
+        If I = 4 Then MM_ADEF = MM_ANUM
+    Next
+    If MM_ANUM > 0 Then
+        If toprate < 4 Then MM_ADEF = MM_ANUM
+        If minlim > 4 Then MM_ADEF = 1
+    End If
+End Sub
+
+' what kind of audio list does the current form need ?  0 = none (type a sample rate)
+Function MM_AudioKind%
+    Dim T As Integer
+    T = MM_Type
+    Select Case T
+        Case MM_SECTOR, MM_VGA: MM_AudioKind = 1
+        Case MM_AMIGA: MM_AudioKind = 2
+        Case MM_SPRITE
+            If MM_Sel(ResDD) = 9 And MM_HB Then MM_AudioKind = 1 Else MM_AudioKind = 0
+        Case Else: MM_AudioKind = 0
+    End Select
+End Function
+
+Sub MM_FillAudioList
+    Dim K As Integer, I As Integer, fps As Double
+    Dim S$, key$
+    Dim keep As Integer
+    K = MM_AudioKind
+    If K = 0 Then Exit Sub
+    fps = Val(M_FPS$)
+    MM_BuildAudioChoices K, fps, MM_Chk(Audio16CB), MM_Chk(AudioStereoCB)
+    key$ = Str$(K) + "/" + Str$(fps) + "/" + Str$(MM_Chk(Audio16CB)) + Str$(MM_Chk(AudioStereoCB)) + Str$(AMIGA_PAL)
+    If key$ = MM_AUDLAST$ Then Exit Sub
+    keep = 0
+    If MM_AUDLAST$ <> "" Then keep = MM_Sel(AudioSizeDD)
+    MM_AUDLAST$ = key$
+    ResetList AudioSizeDD
+    For I = 1 To MM_ANUM
+        If K = 2 Then
+            S$ = _Trim$(Str$(_Round(MM_ARATE(I)))) + " Hz   audio frame " + _Trim$(Str$(MM_AFRAME(I))) + " bytes"
+        Else
+            S$ = _Trim$(Str$(_Round(MM_ARATE(I)))) + " Hz   audio frame " + _Trim$(Str$(MM_AFRAME(I))) + " bytes"
+        End If
+        AddItem AudioSizeDD, S$
+    Next
+    If keep >= 1 And keep <= MM_ANUM Then Control(AudioSizeDD).Value = keep Else Control(AudioSizeDD).Value = MM_ADEF
+    Control(AudioSizeDD).Redraw = True
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Is the 1-bit custom color pair needed ?  etc.
+' ---------------------------------------------------------------------------------
+Function MM_FastApplies%
+    ' can the fast loader be used with the current choices ?
+    Dim T As Integer
+    T = MM_Type
+    MM_FastApplies = _FALSE
+    If FAST_HELPER_PATH$ = "" Then Exit Function
+    If MM_Chk(BadmaiCB) Then Exit Function
+    Select Case T
+        Case MM_SPRITE
+            If MM_Chk(ExtPalCB) Then Exit Function
+            If MM_Sel(ColorDD) >= 5 Then Exit Function
+            If MM_Sel(ColorDD) = 4 Then
+                If MM_Num(ColorsTB) >= 0 And MM_Num(ColorsTB) < 17 Then Exit Function
+            End If
+            MM_FastApplies = _TRUE
+        Case MM_BITMAP, MM_AMIGA
+            MM_FastApplies = _FALSE
+            If T = MM_BITMAP And MM_Sel(ResDD) = 6 Then
+                If Control(PromoteCB).Hidden = 0 And MM_Chk(PromoteCB) Then MM_FastApplies = _TRUE
+            End If
+        Case MM_SECTOR
+            MM_FastApplies = (MM_FormBits = 8)
+        Case MM_DESKTOP
+            MM_FastApplies = _TRUE
+        Case MM_VGA
+            MM_FastApplies = (MM_Sel(VgaDD) <> 4)
+    End Select
+End Function
+
+' ---------------------------------------------------------------------------------
+'  MM_Calc : read the form.  Sets M_ERR$ when something is wrong.
+' ---------------------------------------------------------------------------------
+Sub MM_Calc
+    Dim T As Integer, S As Integer, I As Integer
+    Dim W As Double, H As Double
+    Dim bigaspect As Integer
+    Dim minH As Long, maxH As Long, ldiv As Long
+    Dim dv As Integer
+    Dim bufsz As Double
+    Dim cd As Integer, nc As Double
+    Dim sw As Integer, sh As Integer, grid As Long
+    Dim pm As Integer
+    Dim srcRatio As Double, pixAsp As Double, maxRows As Long
+    Dim e$
+
+    M_ERR$ = "": M_SIZELIMITS$ = ""
+    ' Fast frame loading stays ticked at any depth, but is only used where it applies (8 bit)
+    MM_FASTUSE = MM_Chk(FastCB) And (MM_FastApplies Or (FAST_HELPER_PATH$ <> "" And MM_FastCapable)) And Not MM_Chk(BadmaiCB)
+    MM_CROPSEL = 0
+    If Control(CropDD).Disabled = 0 And Control(CropDD).Hidden = 0 Then MM_CROPSEL = MM_Sel(CropDD) - 1
+    T = MM_Type: M_TYPE = T: S = MM_ResSel: M_SEL = S
+    M_CUSTOM = _FALSE: M_GRAY = _FALSE: M_PSHIFT = _FALSE: M_EXT = _FALSE
+    M_DOWEBP = _FALSE
+    M_DOJPG = _FALSE: M_PROMOTE = _FALSE: M_PAL24 = _FALSE: M_SPI = _FALSE
+    M_DESK = _FALSE: M_NCOLS = 256: M_PALVAL = COLOR_MODE: M_SECTSEL = S
+    M_BIGW = _FALSE: M_JPGQ$ = "4": M_WEBPQ$ = "85"
+    M_BITS = MM_FormBits
+    bigaspect = (Src_Aspect > 1.5) And (Control(CropDD).Value = 1 Or Control(CropDD).Value = 4)
+    If Control(CropDD).Disabled Then bigaspect = (Src_Aspect > 1.5)
+
+    ' palette mode of the shallow bit types
+    M_PALVAL = COLOR_MODE
+    If T = MM_BITMAP Or T = MM_SECTOR Or T = MM_AMIGA Or T = MM_SPRITE Then
+        If M_BITS < 8 Then
+            I = MM_Sel(PalDD)
+            If I > MM_PalN Then I = 1
+            M_PALVAL = MM_PalVal(I)
+            M_GRAY = (M_PALVAL <> COLOR_MODE)
+        End If
+    End If
+
+    Select Case T
+        Case MM_SPRITE
+            If S <= 8 Then
+                M_W = SPR_W(S): M_H = SPR_H(S)
+            Else
+                M_CUSTOM = _TRUE
+                W = MM_Num(WTB): H = MM_Num(HTB)
+                If W < 0 Or H < 0 Then M_ERR$ = "Type a frame width and height.": Exit Sub
+                M_W = W: M_H = H
+                M_SPI = MM_HB
+                ENABLE_SPI_SPRITES = M_SPI
+                If Not IsValidXRes(M_W) Then M_ERR$ = "Frame width must be a multiple of 16 (16 to 640).": Exit Sub
+                If Not IsValidYRes(M_H) Then
+                    If M_SPI Then e$ = "16" Else e$ = "8"
+                    M_ERR$ = "Frame height must be a multiple of " + e$ + " (16 to 480).": Exit Sub
+                End If
+            End If
+            cd = MM_Sel(ColorDD)
+            Select Case cd
+                Case 1: M_NCOLS = 256
+                Case 2: M_NCOLS = 240
+                Case 3: M_NCOLS = 224
+                Case 4
+                    nc = MM_Num(ColorsTB)
+                    If M_CUSTOM Then
+                        If nc < 2 Or nc > 256 Then M_ERR$ = "Number of colors must be 2 to 256.": Exit Sub
+                    Else
+                        If nc < 16 Or nc > 256 Then M_ERR$ = "Number of colors must be 16 to 256.": Exit Sub
+                    End If
+                    M_NCOLS = Int(nc)
+                Case 5, 6: M_NCOLS = 16
+            End Select
+            M_GRAY = (cd = 6) Or (M_BITS < 8 And M_PALVAL <> COLOR_MODE)   ' gray, green and amber phosphor 4 bit palettes
+            If M_NCOLS < 17 Then M_BITS = 4 Else M_BITS = 8
+            ' limits of a sprite video frame
+            sw = MM_SprW(M_W): sh = MM_SprH(M_H)
+            grid = (M_W \ sw) * (M_H \ sh)
+            If M_CUSTOM Then
+                If grid > 63 Then M_ERR$ = "Too many sprites in the grid (" + _Trim$(Str$(grid)) + ").  The limit is 63.": Exit Sub
+            End If
+            If M_SPI Then
+                ' high bandwidth: the frame (whole 512 byte sectors) plus, for 256 colors with a palette, one staging sector
+                ' per buffer must fit the two sprite buffers below $1F9C0:  126 sectors, 125 for 8 bit with a palette block
+                Dim hbmax As Long, hbbytes As Double
+                hbmax = 64512
+                If M_BITS = 8 And Not MM_Chk(ExtPalCB) Then hbmax = 64000
+                hbbytes = M_W * M_H
+                If M_BITS = 4 Then hbbytes = hbbytes / 2
+                If hbbytes > hbmax Then M_ERR$ = "That frame is " + _Trim$(Str$(hbbytes)) + " bytes.  The high bandwidth sprite limit is " + _Trim$(Str$(hbmax)) + " bytes." + CRLF + "Use fewer colors or choose a smaller frame size.": Exit Sub
+            Else
+                If (M_W * M_H) * .5 > 61440 Then M_ERR$ = "That frame buffer is too large for a sprite video.": Exit Sub
+            End If
+            If Not M_SPI And M_BITS = 8 And (M_W * M_H) > 61440 Then M_ERR$ = "An 8 bit frame this size is " + _Trim$(Str$(M_W * M_H)) + " bytes.  The sprite frame limit is 61440 bytes." + CRLF + "Use 16 colors or fewer, or choose a smaller frame size.": Exit Sub
+            M_EXT = MM_Chk(ExtPalCB)
+            If M_BITS = 8 And M_NCOLS > 16 And M_NCOLS < 256 And Not M_EXT Then M_PSHIFT = MM_Chk(PalShiftCB) And (Control(PalShiftCB).Disabled = 0)
+            ' sector alignment valid for this size ?
+            M_SPIOK = _FALSE
+            If M_CUSTOM Then
+                bufsz = (M_W * M_H) / 512
+                If bufsz = Int(bufsz) Then
+                    M_SPIOK = _TRUE
+                    If M_BITS = 4 Then M_SPIOK = ((bufsz / 2) = Int(bufsz / 2))
+                End If
+            End If
+            If M_SPI And Not M_SPIOK Then
+                M_ERR$ = "High bandwidth frames must be whole 512 byte sectors." + CRLF + "Width x height must be a multiple of 512  (1024 for 16 colors or fewer)."
+                Exit Sub
+            End If
+            M_DESK = _FALSE
+        Case MM_BITMAP
+            If S <= 5 Then
+                M_W = BMP_W(S): M_H = BMP_H(S)
+            Else
+                M_CUSTOM = _TRUE
+                W = MM_Num(WTB): H = MM_Num(HTB)
+                If W < 0 Or H < 0 Then M_ERR$ = "Type a frame width and height.": Exit Sub
+                M_W = W: M_H = H
+                If NO_LIMITS Then
+                    If W < 64 Or H < 64 Then M_ERR$ = "Width and height must be at least 64.": Exit Sub
+                Else
+                    If W <> 320 And W <> 640 Then M_ERR$ = "Width must be 320 or 640.": Exit Sub
+                    If H < 71 Or H > 480 Then M_ERR$ = "Height must be 71 to 480.": Exit Sub
+                End If
+                M_DOJPG = NO_LIMITS And MM_CmpOn And (Control(MjpgCB).Hidden = 0)
+                If NO_LIMITS Then
+                    If M_DOJPG Then M_PROMOTE = _TRUE Else M_PROMOTE = MM_Chk(PromoteCB)
+                    If M_PROMOTE Then M_BITS = 8
+                    If M_PROMOTE And Not M_DOJPG Then M_PAL24 = MM_Chk(Pal24CB)
+                End If
+                ' below 8 bit the width must be a whole number of bytes
+                If M_BITS < 8 And M_BITS > 0 And Not M_DOJPG Then
+                    M_W = Int(W / (8 \ M_BITS)) * (8 \ M_BITS)
+                    If M_W < 8 Then M_W = 8
+                End If
+                If Not NO_LIMITS Then
+                    bufsz = (M_W * M_H) / MM_BitDiv(M_BITS)
+                    If bufsz > 38400 Then M_ERR$ = "That frame buffer is " + _Trim$(Str$(bufsz)) + " bytes.  The limit is 38400.": Exit Sub
+                End If
+            End If
+            M_DESK = _FALSE
+            If M_CUSTOM Then
+                bufsz = (M_W * M_H) / MM_BitDiv(M_BITS)
+                M_DESK = (bufsz > 38400) Or M_PAL24 Or (M_BITS = 8)
+                If Not M_DESK Then M_DESK = (M_W <> 640 And M_W <> 320)
+            End If
+            ' a frame rate that is too low drops the bit depth, like the old menu did
+            If Not M_CUSTOM Then
+                Do
+                    M_DEFFPS$ = MM_RateFor(M_W, M_H, M_BITS, _FALSE, _TRUE, _FALSE, M_DESK)
+                    If Val(M_DEFFPS$) < 4 And M_BITS > 1 Then
+                        M_BITS = M_BITS - 1
+                        If M_BITS = 3 Then M_BITS = 2
+                    Else
+                        Exit Do
+                    End If
+                Loop
+            End If
+        Case MM_SECTOR
+            M_SECTSEL = S
+            If S = 7 Then M_SECTSEL = 1
+            M_CUSTOM = MM_Chk(SectCustomCB) And (Control(SectCustomCB).Disabled = 0)
+            Select Case S
+                Case 7
+                    M_W = 640: M_H = 192: M_BIGW = _TRUE
+                Case 1, 4, 5, 6
+                    M_W = 320
+                    If S = 4 Then M_H = 136 Else M_H = 240
+                Case 2, 3
+                    M_W = 640
+                    If S = 3 Then
+                        M_H = 480
+                        If Src_Aspect > 1.5 And (Control(CropDD).Value = 1 Or Control(CropDD).Value = 4) Then M_H = 360
+                    Else
+                        M_H = 240
+                    End If
+            End Select
+            If S = 4 Then
+                nc = MM_Num(ColorsTB)
+                If nc < 2 Or nc > 256 Then M_ERR$ = "Number of colors must be 2 to 256.": Exit Sub
+                M_NCOLS = Int(nc)
+                If M_NCOLS < 17 Then
+                    ' a palette this small is a shallower bit depth
+                    M_SECTSEL = 1
+                    If M_NCOLS < 5 Then M_SECTSEL = 5
+                    If M_NCOLS < 3 Then M_SECTSEL = 3
+                    Select Case M_SECTSEL
+                        Case 1: M_BITS = 4: M_W = 320: M_H = 240
+                        Case 5: M_BITS = 2: M_W = 320: M_H = 240
+                        Case 3: M_BITS = 1: M_W = 640: M_H = 480
+                    End Select
+                    S = M_SECTSEL
+                End If
+            Else
+                M_NCOLS = 256
+                If M_BITS = 4 Then M_NCOLS = 16
+                If M_BITS = 2 Then M_NCOLS = 4
+                If M_BITS = 1 Then M_NCOLS = 2
+            End If
+            If M_BITS = 8 Then M_PSHIFT = MM_Chk(PalShiftCB) And (Control(PalShiftCB).Disabled = 0)
+            If M_CUSTOM Then
+                M_BIGW = _FALSE
+                If M_SECTSEL = 1 Then
+                    If MM_Num(WTB) = 640 Then M_BIGW = _TRUE: M_W = 640: M_H = 192
+                End If
+                maxH = 192: ldiv = 8: minH = 120
+                If (M_SECTSEL = 1 And Not M_BIGW) Or M_SECTSEL = 2 Then
+                    maxH = 384: ldiv = 16: minH = 128
+                    If bigaspect Then maxH = 352
+                End If
+                H = MM_Num(HTB)
+                If H < 0 Then M_ERR$ = "Type a frame height.": Exit Sub
+                ' clamp (instead of an error): at most 61440 bytes per frame, and for 4 / 8 bit
+                ' a whole number of 512 byte sectors (1 / 2 bit may be padded)
+                H = Int(H)
+                If maxH > MM_AspectMaxLines(T) Then maxH = MM_AspectMaxLines(T)
+                If H > maxH Then H = maxH
+                If H < minH Then H = minH
+                H = Int(H / ldiv) * ldiv
+                If H < minH Then H = minH
+                If M_BITS >= 4 Then
+                    Do While (M_W * H * M_BITS / 8 > 61440 Or ((M_W * H * M_BITS / 8) Mod 512) <> 0) And H > ldiv
+                        H = H - 1
+                    Loop
+                End If
+                M_H = H
+                M_SIZELIMITS$ = "Height " + _Trim$(Str$(minH)) + " - " + _Trim$(Str$(maxH)) + ", multiple of " + _Trim$(Str$(ldiv))
+            End If
+        Case MM_DESKTOP
+            M_CUSTOM = _TRUE
+            W = MM_Num(WTB): H = MM_Num(HTB)
+            If W < 0 Or H < 0 Then M_ERR$ = "Type a frame width and height.": Exit Sub
+            If W < 64 Or H < 64 Then M_ERR$ = "Width and height must be at least 64.": Exit Sub
+            If M_BITS < 8 And M_BITS > 0 Then W = Int(W / (8 \ M_BITS)) * (8 \ M_BITS)
+            M_W = W: M_H = H
+            M_BITS = 8
+            M_PROMOTE = _TRUE
+            M_DOJPG = MM_CmpOn
+            If Not M_DOJPG Then M_PAL24 = _TRUE
+            M_DESK = _TRUE
+        Case MM_VGA
+            M_BITS = 8
+            M_W = 320
+            M_H = 200
+            M_SEL = MM_Sel(VgaDD)
+            If M_SEL = 3 Then M_H = 240
+            M_NCOLS = 256
+            If M_SEL = 4 Then M_BITS = 4: M_NCOLS = 16 ' VGA 16 color (VTYPE 88, BPP 4)
+        Case MM_AMIGA
+            W = MM_Num(WTB)
+            If W < 16 Or W > 320 Then M_ERR$ = "Amiga width must be 16 to 320.": Exit Sub
+            W = Int(W / 16) * 16
+            If W < 16 Then W = 16
+            If Src_Width > 0 And Src_Height > 0 Then srcRatio = Src_Height / Src_Width Else srcRatio = .75
+            If Control(CropDD).Value = 2 Or Control(CropDD).Value = 3 Then srcRatio = .75
+            If MM_Sel(AmiStdDD) = 2 Then
+                maxRows = 256: pixAsp = 240 / 256
+            Else
+                maxRows = 200: pixAsp = 240 / 200
+            End If
+            Do
+                H = _Round((W * srcRatio) / pixAsp)
+                H = Int(H / 2) * 2
+                If H > maxRows And W > 16 Then W = W - 16 Else Exit Do
+            Loop
+            If H > maxRows Then H = maxRows
+            If H < 2 Then H = 2
+            M_W = W: M_H = H
+            Select Case M_BITS
+                Case 1: M_NCOLS = 2
+                Case 2: M_NCOLS = 4
+                Case Else: M_NCOLS = 16
+            End Select
+    End Select
+
+    ' keep original aspect: HINT "A" window limits, K padding (MM_ASPECT.BM)
+    MM_AspectCalc T
+    If M_ERR$ <> "" Then Exit Sub
+
+    ' JPG quality
+    If M_DOJPG Then
+        M_DOWEBP = (MM_Chk(WebpCB) And Control(WebpCB).Hidden = 0)
+        If M_DOWEBP Then
+            nc = MM_Num(WebpQTB)
+            If nc < 1 Or nc > 100 Then M_ERR$ = "WebP quality must be 1 to 100  (100 = highest).": Exit Sub
+            M_WEBPQ$ = _Trim$(Str$(Int(nc)))
+        Else
+            nc = MM_Num(JpgQTB)
+            If nc < 1 Or nc > 31 Then M_ERR$ = "JPG quality must be 1 to 31  (1 = highest).": Exit Sub
+            M_JPGQ$ = _Trim$(Str$(Int(nc)))
+        End If
+    End If
+
+    ' ---- the frame rate
+    Dim sectorish As Integer
+    sectorish = (T = MM_SECTOR Or T = MM_VGA) Or (T = MM_SPRITE And M_SPI)
+    M_FLIMIT = 31
+    If sectorish Then M_FLIMIT = 61
+    If NO_LIMITS And (T = MM_DESKTOP Or M_DESK) Then M_FLIMIT = 61
+    M_FPSEDIT = (T = MM_SECTOR Or T = MM_DESKTOP Or T = MM_VGA Or T = MM_AMIGA) Or (T = MM_SPRITE And M_CUSTOM) Or (T = MM_BITMAP And M_CUSTOM)
+    Select Case T
+        Case MM_SPRITE
+            If M_CUSTOM Then
+                If M_SPI Then
+                    M_DEFFPS$ = MM_SectorRate(M_W, M_H, M_BITS, _FALSE)
+                Else
+                    M_DEFFPS$ = MM_RateFor(M_W, M_H, M_BITS, _FALSE, _FALSE, M_BITS = 4, _FALSE)
+                End If
+                If Val(M_DEFFPS$) > 15 And Not NO_LIMITS Then M_DEFFPS$ = "15"
+            Else
+                M_DEFFPS$ = MM_RateFor(M_W, M_H, M_BITS, _FALSE, _FALSE, M_BITS = 4, _FALSE)
+            End If
+        Case MM_BITMAP
+            If M_CUSTOM Then
+                M_DEFFPS$ = MM_RateFor(M_W, M_H, M_BITS, _FALSE, _TRUE, _FALSE, M_DESK)
+                If Val(M_DEFFPS$) > 15 And Not NO_LIMITS Then M_DEFFPS$ = "15"
+            End If
+        Case MM_SECTOR
+            M_DEFFPS$ = MM_SectorRate(M_W, M_H, M_BITS, _FALSE)
+            If Val(M_DEFFPS$) > 15 And Not NO_LIMITS Then M_DEFFPS$ = "15"
+        Case MM_DESKTOP
+            M_DEFFPS$ = MM_RateFor(M_W, M_H, M_BITS, _FALSE, _TRUE, _FALSE, _TRUE)
+            If Val(M_DEFFPS$) > 15 And Not NO_LIMITS Then M_DEFFPS$ = "15"
+        Case MM_VGA
+            If M_SEL = 4 Then M_DEFFPS$ = "15" Else M_DEFFPS$ = "12.5"
+            If Val(M_DEFFPS$) > 15 And Not NO_LIMITS Then M_DEFFPS$ = "15"
+        Case MM_AMIGA
+            M_DEFFPS$ = "10"
+            M_FLIMIT = 31
+    End Select
+    M_FPS$ = M_DEFFPS$
+    If M_FPSEDIT And MM_Chk(CustomFpsCB) And Control(CustomFpsCB).Disabled = 0 Then
+        S = 0
+        nc = MM_Num(FpsTB)
+        If nc <= 3.98 Or nc >= M_FLIMIT Then
+            M_ERR$ = "Frame rate must be more than 3.98 and less than " + _Trim$(Str$(M_FLIMIT)) + "."
+            Exit Sub
+        End If
+        nc = (_Round(nc * 100)) / 100
+        If nc > (M_FLIMIT - 1) Then nc = M_FLIMIT - 1
+        M_FPS$ = _Trim$(Str$(nc))
+    End If
+
+    ' ---- crop / audio checks
+    If Control(CropDD).Value = 4 And Not Control(CropDD).Disabled Then
+        If Src_Aspect <= 16 / 9 Then M_ERR$ = "'Crop ultra wide to 16:9' needs a source wider than 16:9.": Exit Sub
+    End If
+    If MM_AudioKind = 0 Then
+        nc = MM_Num(AudioRateTB)
+        If nc < 6000 Or nc > 48828 Then M_ERR$ = "Audio sample rate must be 6000 to 48828 Hz.": Exit Sub
+    End If
+    nc = MM_Num(ThreadsTB)
+    If nc < 1 Or nc > MAX_PIPE_THREADS Or nc <> Int(nc) Then M_ERR$ = "ImageMagick threads must be 1 to " + _Trim$(Str$(MAX_PIPE_THREADS)) + ".": Exit Sub
+    If MM_Chk(PreFilterCB) Then
+        If _Trim$(Text(PreFilterTB)) = "" Then M_ERR$ = "Type the external pre-filter command, or turn it off.": Exit Sub
+    End If
+End Sub

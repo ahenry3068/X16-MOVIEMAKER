@@ -1,0 +1,319 @@
+' MM_SHOWIT.BM -- the conversion preview (the old Showit), drawn on an off screen image
+' that is displayed inside the PreviewPB picture box.
+Sub Showit
+    Dim tmp$
+    Static InShow
+    Static Show3&
+    Static ShowWidth, ShowHeight
+    Static ImgX%, ImgY%
+    Static prw As Integer
+    Static DImage As _MEM
+    Static I As Long
+    Static LastGood As Long
+    Static LastGoodT As Double
+    Static LastPartShown As Integer
+    Dim pn$, tn$, px As Long
+    Dim LumSum As Double, LumN As Long, Stp As Long, PC As Long, IsDark As Integer
+    Dim P$
+    Dim D%
+    Dim X2 As Long
+    Dim BLUECOL As Integer
+    Dim AmiAR As Double
+    Dim ar As Double
+    Dim BX As Long
+    Dim ci As Long
+    Dim OC As Long
+    Const SCRW = 700
+    Const SCRH = 584
+    Dim AmiK As Double
+
+    If MM_SHOW_RESET Then
+        MM_SHOW_RESET = _FALSE
+        InShow = _FALSE
+        If Show3& < -1 Then _FreeImage Show3&
+        Show3& = 0
+        If Show& < -1 Then _FreeImage Show&
+        Show& = 0
+        If DImage.OFFSET <> 0 Then _MemFree DImage
+        If LastGood < -1 Then _FreeImage LastGood
+        LastGood = 0: LastGoodT = 0
+        If Show2& < -1 Then _FreeImage Show2&
+        Show2& = 0
+    End If
+    _Dest _Console
+
+    If Not InShow Then
+
+        ' the picture window: as big as the box allows, in the right shape (4:3, 16:9, 9:16 ...)
+        ar = 4 / 3
+        If ((Src_Aspect < 1 And (Not Bit_Map_Mode))) Or (NO_LIMITS And VideoHeader.HINT = "T") Then
+            ar = 203 / 359
+        ElseIf WIDE_DISPLAY Then
+            ar = 16 / 9
+        End If
+        If Src_Aspect < 1 And K_TYPE Then ar = 240 / 359
+        If ASPECT_A And ASPECT_VAL > 0.3 And ASPECT_VAL < 6 Then ar = ASPECT_VAL
+        If FOR_AMIGA Then
+            ' true display shape: Amiga lowres pixels are 1.2x (NTSC) or 0.9375x (PAL) as tall as wide
+            If AMIGA_PAL Then AmiK = 240 / 256 Else AmiK = 240 / 200
+            ar = ImageWidth / (ImageHeight * AmiK)
+        End If
+        ShowHeight = 380
+        ShowWidth = _Round(ShowHeight * ar)
+        If ShowWidth > 676 Then
+            ShowWidth = 676
+            ShowHeight = _Round(ShowWidth / ar)
+        End If
+        ImgX% = (SCRW - ShowWidth) \ 2
+        ImgY% = 36 + (380 - ShowHeight) \ 2
+
+        PWindowX% = ImgX%
+        PWindowY% = ImgY%
+
+        If DO_JPG Then GoTo SKIP1
+        Show& = _NewImage(ShowWidth, ShowHeight, 256)
+        Show2& = _NewImage(wid, hei, 256)
+        DImage = _MemImage(Show2&)
+
+        SKIP1:
+        Show3& = _NewImage(SCRW, SCRH, 32)
+        _Font 8, Show3&
+        prw = _PrintWidth("100.00", Show3&)
+        _Font 16, Show3&
+        _Dest Show3&
+        MM_PREVIEW_IMG = Show3&
+        MM_PREVIEW_ON = _TRUE
+
+        If USE_QB64FASTMODE Then
+            tmp$ = "FAST Convert - "
+        Else
+            tmp$ = "Converting - "
+        End If
+        tmp$ = tmp$ + GetFileName(MovieName$) + " (" + _Trim$(Str$(FrameCount)) + " frames)"
+        If FOR_VGA Then
+            tmp$ = tmp$ + " (VGA Mode Video)"
+        End If
+        MM_ConvTitle tmp$
+
+
+
+        Line (0, 0)-(SCRW - 1, 452), _RGB32(0, 0, 175), BF
+        Line (0, 453)-(SCRW - 1, SCRH - 1), _RGB32(0, 0, 0), BF
+        _Font 16, Show3&
+        _PrintMode _KeepBackground
+        BX = ImgX% + ShowWidth + 8 - 154
+
+
+        Color _RGB32(128, 244, 55)
+        _PrintString (BX, ImgY% - 28), "F12"
+        Color _RGB32(161, 17, 17)
+        _PrintString (BX + 30, ImgY% - 28), "-"
+        Color _RGB32(255, 255, 255)
+        _PrintString (BX + 42, ImgY% - 28), "Frame Snapshot"
+        _PrintMode _FillBackground
+        LastPartShown = 0
+
+        ' orange border all the way around the text / information part
+        For ci = 0 To 2
+            If ci = 0 Then OC = _RGB32(180, 100, 100)
+            If ci = 1 Then OC = _RGB32(150, 70, 70)
+            If ci = 2 Then OC = _RGB32(85, 40, 40)
+            Line (ci, 454 + ci)-(SCRW - 1 - ci, SCRH - 1 - ci), OC, B
+        Next
+        ' Line (ImgX% - 8, ImgY% - 8)-(ImgX% + (ShowWidth) + 8, ImgY% + (ShowHeight) + 7), _RGB32(100, 110, 100), BF
+        ' Line (ImgX% - 5, ImgY% - 5)-(ImgX% + (ShowWidth) + 5, ImgY% + (ShowHeight) + 4), _RGB32(45, 35, 45), BF
+        Dim GC As Integer
+        GC = 207
+        For D% = 8 To 0 Step -1
+            BLUECOL = GC + 20
+            Line (ImgX% - D%, ImgY% - D%)-(ImgX% + (ShowWidth) + D%, ImgY% + (ShowHeight) + D% - 1), _RGB32(GC, GC, BLUECOL), BF
+            GC = GC - 23
+        Next
+
+
+        Locate 35, 2
+        Tprint " {WHT}VType{GRN}: {LIGHT GREEN}" + _Trim$(Str$(VideoHeader.VTYPE)) + "   {YEL}"
+        Tprint "{YEL}" + Str$(VideoHeader.BPP) + "{GRAY 1} Bits Per Pixel{RED}.{WHT}"
+        Tprint "   {WHT}Audio{GRN}: {LIGHT GREEN}"
+        If Interleave_Audio Then
+            Tprint "Embedded{WHT}"
+            Tprint "  {YEL}" + _Trim$(Str$(Audio_FrameSize))
+            Tprint "{GRAY 1} audio bytes{GRN}/{GRAY 1}frame"
+        Else
+            Tprint "SVA {GRN}file{WHT}"
+        End If
+
+        Locate 36, 2
+        Tprint " {YEL}" + _Trim$(Str$(FrameCount))
+        If Bit_Map_Mode Then
+            Tprint "  {WHT}BIT Mapped{GRAY 1} frames{RED}.  "
+        Else
+            Tprint "  {WHT}SPRITE Based{GRAY 1} frames{RED}. "
+        End If
+        Tprint "{YEL}" + _Trim$(Str$(TRUE_FPS)) + " {LIGHT RED}fps {GRAY 1}video{RED}."
+        Tprint "  {WHT}Encoded RES{GRN}: {YEL}" + _Trim$(Str$(ImageWidth)) + "{LIGHT RED}x{YEL}" + _Trim$(Str$(ImageHeight))
+        If DO_JPG Then
+            If DO_WEBP Then _PutImage (SCRW \ 2 - 60, 486), WEBPPic& Else _PutImage (SCRW \ 2 - 60, 486), MJPGPic&
+        End If
+    End If
+    If DO_JPG Then GoTo SKIP2
+    _Dest Show2&
+
+    ' sprite video with a static (external / VERA default) palette: show the colors the file will really use
+    If EXT_PALETTE_ON And Not Bit_Map_Mode Then
+        For I = 0 To EXT_UPPER_COLOR
+            ImagePalette(I) = TARGET_PAL_FOR_MAPPING(I + EXT_OFFSET)
+        Next
+    End If
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:Off
+    $End If
+    I = 0
+    Do
+        _PaletteColor I, ImagePalette(I), Show2&
+        I = I + 1
+    Loop Until I = 256
+
+    _MemPut DImage, DImage.OFFSET, ImageData()
+
+    $If CHECK_ERRORS = FALSE Then
+        $Checking:On
+    $End If
+    SKIP2:
+    _Dest Show3&
+    If DO_PART_VIDEO Then
+        If CURRENT_PART <> LastPartShown Then
+            LastPartShown = CURRENT_PART
+                pn$ = _Trim$(Str$(CURRENT_PART)): tn$ = _Trim$(Str$(NUMBER_OF_PARTS))
+                Line (PWindowX% - 8, PWindowY% - 30)-(PWindowX% + 24 + _PrintWidth("PART #: " + pn$ + " of " + tn$), PWindowY% - 12), _RGB32(0, 0, 175, 255), BF
+                _PrintMode _KeepBackground
+                px = PWindowX% - 4
+                Color _RGB32(255, 255, 255, 255)
+                _PrintString (px, PWindowY% - 28), "PART #"
+                px = px + _PrintWidth("PART #")
+                Color _RGB32(10, 200, 25, 255)
+                _PrintString (px, PWindowY% - 28), ": "
+                px = px + _PrintWidth(": ")
+                Color _RGB32(233, 255, 50, 255)
+                _PrintString (px, PWindowY% - 28), pn$
+                px = px + _PrintWidth(pn$ + " ")
+                Color _RGB32(255, 255, 255, 255)
+                _PrintString (px, PWindowY% - 28), "of"
+                px = px + _PrintWidth("of ")
+                Color _RGB32(233, 255, 50, 255)
+                _PrintString (px, PWindowY% - 28), tn$
+                _PrintMode _FillBackground
+        End If
+    End If
+
+    P$ = Str$(Percentage)
+    D% = InStr(P$, ".")
+    If D% Then
+        P$ = Left$(P$, D% + 2)
+    Else
+        P$ = P$ + ".00"
+    End If
+    P$ = P$ + "%"
+    X2 = ((SCRW - 1) * (Percentage / 100))
+
+    _PrintMode _KeepBackground , Show3&
+
+    ' --- Colors for a recessed (sunken) bevel ---
+    Dim shadowDark As Long, shadowMid As Long
+    Dim highlightLight As Long, highlightMid As Long
+    Dim fillTop As Long, fillMid As Long, fillBot As Long
+
+    shadowDark = _RGB32(8, 8, 10, 255)
+    shadowMid = _RGB32(40, 40, 46, 255)
+    highlightLight = _RGB32(220, 220, 212, 255)
+    highlightMid = _RGB32(140, 140, 134, 255)
+
+    ' --- Outer bevel ring: dark top/left, light bottom/right ---
+    Line (-1, 431)-(SCRW, 447), shadowDark, B ' full dark frame (top raised by 2px)
+    Line (-1, 447)-(SCRW, 447), highlightLight ' bottom edge -> light (unchanged)
+    Line (SCRW, 431)-(SCRW, 447), highlightLight ' right edge  -> light
+
+    ' --- Inner bevel ring (adds the "double groove" depth) ---
+    Line (0, 432)-(SCRW - 1, 446), shadowMid, B
+    Line (0, 446)-(SCRW - 1, 446), highlightMid
+    Line (SCRW - 1, 432)-(SCRW - 1, 446), highlightMid
+
+    ' --- Recessed track background (dark red channel) ---
+    Line (1, 433)-(SCRW - 2, 445), _RGB32(30, 8, 8, 255), BF
+
+    ' --- Progress fill, muted red gradient (brighter than channel, not scarlet) ---
+    fillTop = _RGB32(60, 54, 12, 255)
+    fillMid = _RGB32(200, 161, 39, 255)
+    fillBot = _RGB32(70, 56, 16, 255)
+
+    If X2 > 0 Then
+        Dim yy As Integer, t As Single, r As Integer, g As Integer, b As Integer
+        For yy = 433 To 445
+            If yy <= 439 Then
+                t = (yy - 433) / 6.0
+                r = 60 + t * (120 - 60)
+                g = 12 + t * (30 - 12)
+                b = 12 + t * (28 - 12)
+            Else
+                t = (yy - 439) / 6.0
+                r = 120 + t * (70 - 120)
+                g = 30 + t * (16 - 30)
+                b = 28 + t * (16 - 28)
+            End If
+            Line (0, yy)-(X2, yy), _RGB32(r, g, b, 255)
+        Next yy
+    End If
+
+    _Font 8, Show3&
+    If Percentage < 100 Then
+        _PrintString ((X2 - prw) - 8, 437), P$, Show3&
+    Else
+        _PrintString (SCRW \ 2 + 40 - prw, 437), "100.00 %", Show3&
+    End If
+    _PrintMode _FillBackground , Show3&
+    _Font 16, Show3&
+
+    If DO_JPG Then
+        _PutImage (ImgX%, ImgY%)-(ImgX% + ShowWidth, ImgY% + ShowHeight), JPG_IMAGE, Show3&
+        GoTo SKIP3
+    End If
+    _CopyPalette Show2&, Show&
+    _PutImage , Show2&, Show&
+    _PutImage (ImgX%, ImgY%), Show&, Show3&
+    ' Keep the last frame that was not (nearly) black, and show it when the picture would be
+    ' black, so the video window always has something in it (a clip that fades out at the end).
+    LumSum = 0: LumN = 0
+    Stp = (wid * hei) \ 400
+    If Stp < 1 Then Stp = 1
+    I = 0
+    Do While I < wid * hei
+        PC = ImagePalette(ImageData(I))
+        LumSum = LumSum + _Red32(PC) * .3 + _Green32(PC) * .59 + _Blue32(PC) * .11
+        LumN = LumN + 1
+        I = I + Stp
+    Loop
+    IsDark = _FALSE
+    If LumN > 0 Then If LumSum / LumN < 12 Then IsDark = _TRUE
+    If Not IsDark Then
+        If Timer - LastGoodT > .5 Or Timer < LastGoodT Or Percentage >= 100 Then
+            If LastGood >= -1 Then LastGood = _NewImage(ShowWidth, ShowHeight, 32)
+            _PutImage , Show&, LastGood
+            LastGoodT = Timer
+        End If
+    ElseIf LastGood < -1 And Percentage >= 100 Then
+        _PutImage (ImgX%, ImgY%), LastGood, Show3&
+    End If
+    Rem     Screen Show&
+    SKIP3:
+    _Dest _Console
+    InShow = _TRUE
+    MM_PREVIEW_IMG = Show3&
+    MM_PREVIEW_ON = _TRUE
+    If Abs(Timer - MM_LASTPROGRESS) >= .04 Or Percentage >= 100 Then
+        MM_LASTPROGRESS = Timer
+        MM_BlitImage Show3&
+        Control(ConvPB).Value = Percentage
+        Control(ConvPB).Redraw = True
+        MM_Pump
+    End If
+End Sub

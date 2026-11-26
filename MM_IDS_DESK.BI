@@ -1,0 +1,222 @@
+DIM SHARED MovieMakerIF AS LONG
+DIM SHARED UnlockFR AS LONG
+DIM SHARED NoLimitsCB AS LONG
+DIM SHARED VgaCB AS LONG
+DIM SHARED AmigaCB AS LONG
+DIM SHARED AboutBtn AS LONG
+DIM SHARED LicenseBtn AS LONG
+DIM SHARED SrcFR AS LONG
+DIM SHARED SrcBtn AS LONG
+DIM SHARED FramesBtn AS LONG
+DIM SHARED SrcNameLB AS LONG
+DIM SHARED SrcInfoLB AS LONG
+DIM SHARED ProjLB AS LONG
+DIM SHARED ProjTB AS LONG
+DIM SHARED TypeFR AS LONG
+DIM SHARED TypeRB1 AS LONG
+DIM SHARED TypeRBHS AS LONG
+DIM SHARED TypeRB2 AS LONG
+DIM SHARED TypeRB3 AS LONG
+DIM SHARED TypeRB4 AS LONG
+DIM SHARED TypeRB5 AS LONG
+DIM SHARED TypeRB6 AS LONG
+DIM SHARED OutFR AS LONG
+DIM SHARED OutLB AS LONG
+DIM SHARED OutTB AS LONG
+DIM SHARED DeleteCB AS LONG
+DIM SHARED PreviewCB AS LONG
+DIM SHARED TestPlayCB AS LONG
+DIM SHARED PauseCB AS LONG
+DIM SHARED SplitCB AS LONG
+DIM SHARED PartSizeLB AS LONG
+DIM SHARED PartSizeDD AS LONG
+DIM SHARED PartsPrevCB AS LONG
+DIM SHARED TargetLB AS LONG
+DIM SHARED ResFR AS LONG
+DIM SHARED ResDD AS LONG
+DIM SHARED WLB AS LONG
+DIM SHARED WTB AS LONG
+DIM SHARED HLB AS LONG
+DIM SHARED HTB AS LONG
+DIM SHARED SpiCB AS LONG
+DIM SHARED SectCustomCB AS LONG
+DIM SHARED EncDimLB AS LONG
+DIM SHARED EncDimUL AS LONG
+DIM SHARED VgaDD AS LONG
+DIM SHARED AmiStdDD AS LONG
+DIM SHARED AmiHLB AS LONG
+DIM SHARED PromoteCB AS LONG
+DIM SHARED Pal24CB AS LONG
+DIM SHARED CmpLB AS LONG
+DIM SHARED MjpgCB AS LONG
+DIM SHARED JpgQTB AS LONG
+DIM SHARED JpgQLB AS LONG
+DIM SHARED WebpCB AS LONG
+DIM SHARED WebpQTB AS LONG
+DIM SHARED WebpQLB AS LONG
+DIM SHARED CmpNoteLB AS LONG
+DIM SHARED SprInfoLB AS LONG
+DIM SHARED TallCB AS LONG
+DIM SHARED AspectCB AS LONG
+DIM SHARED ColFR AS LONG
+DIM SHARED ColorDD AS LONG
+DIM SHARED BitsLB AS LONG
+DIM SHARED BitRB1 AS LONG
+DIM SHARED BitRB2 AS LONG
+DIM SHARED BitRB3 AS LONG
+DIM SHARED BitRB4 AS LONG
+DIM SHARED PalLB AS LONG
+DIM SHARED PalDD AS LONG
+DIM SHARED ColorsLB AS LONG
+DIM SHARED ColorsTB AS LONG
+DIM SHARED PalShiftCB AS LONG
+DIM SHARED C1FgBtn AS LONG
+DIM SHARED C1BgBtn AS LONG
+DIM SHARED C1PB AS LONG
+DIM SHARED ExtPalCB AS LONG
+DIM SHARED ExtMethodDD AS LONG
+DIM SHARED SaveMapCB AS LONG
+DIM SHARED FfColorCB AS LONG
+DIM SHARED AudFR AS LONG
+DIM SHARED CustomFpsCB AS LONG
+DIM SHARED FpsTB AS LONG
+DIM SHARED FpsInfoLB AS LONG
+DIM SHARED InterleaveCB AS LONG
+DIM SHARED Audio16CB AS LONG
+DIM SHARED AudioStereoCB AS LONG
+DIM SHARED AudNoteLB AS LONG
+DIM SHARED AudioRateLB AS LONG
+DIM SHARED AudioRateTB AS LONG
+DIM SHARED AudioSizeLB AS LONG
+DIM SHARED AudioSizeDD AS LONG
+DIM SHARED CropLB AS LONG
+DIM SHARED CropDD AS LONG
+DIM SHARED RateInfoLB AS LONG
+DIM SHARED EngFR AS LONG
+DIM SHARED FastCB AS LONG
+DIM SHARED ImagickCB AS LONG
+DIM SHARED BadmaiCB AS LONG
+DIM SHARED YoloCB AS LONG
+DIM SHARED ThreadsLB AS LONG
+DIM SHARED ThreadsTB AS LONG
+DIM SHARED DitherLB AS LONG
+DIM SHARED DitherDD AS LONG
+DIM SHARED DitherTB AS LONG
+DIM SHARED MagickLB AS LONG
+DIM SHARED MagickTB AS LONG
+DIM SHARED BadmaiXLB AS LONG
+DIM SHARED BadmaiXTB AS LONG
+DIM SHARED PreFilterCB AS LONG
+DIM SHARED PreFilterTB AS LONG
+DIM SHARED StatusLB AS LONG
+DIM SHARED ConvertBtn AS LONG
+DIM SHARED QuitBtn AS LONG
+DIM SHARED PreviewPB AS LONG
+DIM SHARED ConvTitleLB AS LONG
+DIM SHARED ConvPB AS LONG
+DIM SHARED ConvInfoLB AS LONG
+DIM SHARED CancelBtn AS LONG
+DIM SHARED SnapBtn AS LONG
+DIM SHARED PlayBtn AS LONG
+DIM SHARED OpenBtn AS LONG
+DIM SHARED BackBtn AS LONG
+
+' Control groups used to switch between the setup page and the conversion page
+CONST MM_NSETUP = 83
+CONST MM_NCONV = 9
+DIM SHARED MM_SetupIDs(1 TO MM_NSETUP) AS LONG
+DIM SHARED MM_ConvIDs(1 TO MM_NCONV) AS LONG
+SUB MM_FillGroups
+    MM_SetupIDs(1) = AboutBtn
+    MM_SetupIDs(2) = LicenseBtn
+    MM_SetupIDs(3) = SrcFR
+    MM_SetupIDs(4) = SrcBtn
+    MM_SetupIDs(5) = FramesBtn
+    MM_SetupIDs(6) = SrcNameLB
+    MM_SetupIDs(7) = SrcInfoLB
+    MM_SetupIDs(8) = ProjLB
+    MM_SetupIDs(9) = ProjTB
+    MM_SetupIDs(10) = TypeFR
+    MM_SetupIDs(11) = TypeRB2
+    MM_SetupIDs(12) = TypeRB4
+    MM_SetupIDs(13) = OutFR
+    MM_SetupIDs(14) = OutLB
+    MM_SetupIDs(15) = OutTB
+    MM_SetupIDs(16) = DeleteCB
+    MM_SetupIDs(17) = PreviewCB
+    MM_SetupIDs(18) = TestPlayCB
+    MM_SetupIDs(19) = PauseCB
+    MM_SetupIDs(20) = SplitCB
+    MM_SetupIDs(21) = PartSizeLB
+    MM_SetupIDs(22) = PartSizeDD
+    MM_SetupIDs(23) = PartsPrevCB
+    MM_SetupIDs(24) = TargetLB
+    MM_SetupIDs(25) = ResFR
+    MM_SetupIDs(26) = WLB
+    MM_SetupIDs(27) = WTB
+    MM_SetupIDs(28) = HLB
+    MM_SetupIDs(29) = HTB
+    MM_SetupIDs(30) = PromoteCB
+    MM_SetupIDs(31) = Pal24CB
+    MM_SetupIDs(32) = CmpLB
+    MM_SetupIDs(33) = MjpgCB
+    MM_SetupIDs(34) = JpgQTB
+    MM_SetupIDs(35) = JpgQLB
+    MM_SetupIDs(36) = WebpCB
+    MM_SetupIDs(37) = WebpQTB
+    MM_SetupIDs(38) = WebpQLB
+    MM_SetupIDs(39) = CmpNoteLB
+    MM_SetupIDs(40) = TallCB
+    MM_SetupIDs(41) = ColFR
+    MM_SetupIDs(42) = BitsLB
+    MM_SetupIDs(43) = BitRB1
+    MM_SetupIDs(44) = BitRB2
+    MM_SetupIDs(45) = BitRB3
+    MM_SetupIDs(46) = BitRB4
+    MM_SetupIDs(47) = PalLB
+    MM_SetupIDs(48) = PalDD
+    MM_SetupIDs(49) = C1FgBtn
+    MM_SetupIDs(50) = C1BgBtn
+    MM_SetupIDs(51) = C1PB
+    MM_SetupIDs(52) = AudFR
+    MM_SetupIDs(53) = CustomFpsCB
+    MM_SetupIDs(54) = FpsTB
+    MM_SetupIDs(55) = FpsInfoLB
+    MM_SetupIDs(56) = InterleaveCB
+    MM_SetupIDs(57) = Audio16CB
+    MM_SetupIDs(58) = AudioStereoCB
+    MM_SetupIDs(59) = AudioRateLB
+    MM_SetupIDs(60) = AudioRateTB
+    MM_SetupIDs(61) = CropLB
+    MM_SetupIDs(62) = CropDD
+    MM_SetupIDs(63) = RateInfoLB
+    MM_SetupIDs(64) = EngFR
+    MM_SetupIDs(65) = FastCB
+    MM_SetupIDs(66) = ImagickCB
+    MM_SetupIDs(67) = BadmaiCB
+    MM_SetupIDs(68) = YoloCB
+    MM_SetupIDs(69) = ThreadsLB
+    MM_SetupIDs(70) = ThreadsTB
+    MM_SetupIDs(71) = DitherLB
+    MM_SetupIDs(72) = DitherDD
+    MM_SetupIDs(73) = DitherTB
+    MM_SetupIDs(74) = MagickLB
+    MM_SetupIDs(75) = MagickTB
+    MM_SetupIDs(76) = BadmaiXLB
+    MM_SetupIDs(77) = BadmaiXTB
+    MM_SetupIDs(78) = PreFilterCB
+    MM_SetupIDs(79) = PreFilterTB
+    MM_SetupIDs(80) = StatusLB
+    MM_SetupIDs(81) = ConvertBtn
+    MM_SetupIDs(82) = QuitBtn
+    MM_SetupIDs(83) = AspectCB
+    MM_ConvIDs(1) = PreviewPB
+    MM_ConvIDs(2) = ConvTitleLB
+    MM_ConvIDs(3) = ConvPB
+    MM_ConvIDs(4) = ConvInfoLB
+    MM_ConvIDs(5) = CancelBtn
+    MM_ConvIDs(6) = SnapBtn
+    MM_ConvIDs(7) = PlayBtn
+    MM_ConvIDs(8) = OpenBtn
+    MM_ConvIDs(9) = BackBtn
+END SUB

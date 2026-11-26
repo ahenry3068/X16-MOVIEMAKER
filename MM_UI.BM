@@ -1,0 +1,803 @@
+' MM_UI.BM -- keeps the setup page consistent: shows what applies, grays out what does not.
+
+Dim Shared MM_FASTWANT As Integer
+Dim Shared MM_BADWANT As Integer
+' what UpdateUI last put in the three engine boxes (their ValueChanged events arrive later; only a different value is the user's click)
+Dim Shared MM_FASTLAST As Integer, MM_BADLAST As Integer, MM_IMGLAST As Integer
+Dim Shared MM_DELOFF As Integer ' user unticked 'delete temporary files'
+Dim Shared MM_RATEDEF$
+Dim Shared MM_PALBITS As Integer
+Dim Shared MM_PALTYPE As Integer
+Dim Shared MM_UI_BUSY As Integer
+
+' Information box of the sprite types: sprite size, grid, memory use, and the reason when the
+' settings are not valid (CONVERT stays disabled until they are).
+Sub MM_SprInfo
+    Dim T As Integer, S$, sw As Integer, sh As Integer, cols As Long, rows As Long, grid As Long
+    Dim bytes As Double, sect As Long, units As Long, need As Long, hh As Long, lo As Long, hi As Long
+    T = MM_Type
+    MM_Vis SprInfoLB, (T = MM_SPRITE)
+    If T <> MM_SPRITE Then Exit Sub
+    S$ = ""
+    If M_ERR$ <> "" Then
+        S$ = "Not valid yet:" + Chr$(10) + Replace$(M_ERR$, CRLF, " ", True, 0)
+        If M_SPI And M_W > 15 And M_W < 641 And (M_W Mod 16) = 0 Then
+            need = 512: If M_BITS = 4 Then need = 1024
+            lo = 0: hi = 0
+            For hh = 16 To 480 Step 16
+                If (M_W * hh) Mod need = 0 Then
+                    If hh < M_H Then lo = hh
+                    If hh > M_H And hi = 0 Then hi = hh
+                End If
+            Next
+            If lo > 0 Or hi > 0 Then
+                S$ = S$ + Chr$(10) + "Heights that fit width " + _Trim$(Str$(M_W)) + ":"
+                If lo > 0 Then S$ = S$ + " " + _Trim$(Str$(lo))
+                If hi > 0 Then S$ = S$ + " " + _Trim$(Str$(hi))
+            End If
+        End If
+    ElseIf M_W > 0 And M_H > 0 Then
+        sw = MM_SprW(M_W): sh = MM_SprH(M_H)
+        cols = M_W \ sw: rows = M_H \ sh: grid = cols * rows
+        S$ = "Sprites: " + _Trim$(Str$(sw)) + " x " + _Trim$(Str$(sh)) + " pixels" + Chr$(10)
+        S$ = S$ + "Grid: " + _Trim$(Str$(cols)) + " x " + _Trim$(Str$(rows)) + " = " + _Trim$(Str$(grid)) + " sprites" + Chr$(10)
+        S$ = S$ + "Hardware sprites used: " + _Trim$(Str$(grid * 2)) + " of 127 (two buffers)" + Chr$(10)
+        bytes = M_W * M_H
+        If M_BITS = 4 Then bytes = bytes / 2
+        S$ = S$ + "Frame data: " + _Trim$(Str$(Int(bytes))) + " bytes"
+        If M_SPI Then
+            sect = Int(bytes / 512): If bytes > sect * 512 Then sect = sect + 1
+            S$ = S$ + " = " + _Trim$(Str$(sect)) + " sectors" + Chr$(10)
+            units = sect
+            If M_BITS = 8 And Not MM_Chk(ExtPalCB) Then units = units + 1
+            If units <= 32 Then
+                S$ = S$ + "Video memory: from 1:$3000, graphics and text layers stay available"
+            ElseIf units * 2 <= 216 Then
+                S$ = S$ + "Video memory: from 0:$0000, graphics buffer used, text layer stays"
+            Else
+                S$ = S$ + "Video memory: runs over the text screen, text layer is hidden while playing"
+            End If
+        End If
+    End If
+    If Caption(SprInfoLB) <> S$ Then SetCaption SprInfoLB, S$
+End Sub
+
+' Bytes per frame and the data rate it makes (shown under Timing & audio, all types)
+Function MM_Commas$ (n As Double)
+    Dim s$, r$, i As Long
+    s$ = _Trim$(Str$(Int(n + .5)))
+    r$ = ""
+    For i = Len(s$) To 1 Step -1
+        r$ = Mid$(s$, i, 1) + r$
+        If ((Len(s$) - i + 1) Mod 3) = 0 And i > 1 Then r$ = "," + r$
+    Next
+    MM_Commas = r$
+End Function
+
+Sub MM_RateInfo
+    Dim T As Integer, vid As Double, pal As Double, aud As Double, fps As Double, tot As Double
+    Dim hasAud As Integer, comp As Integer, S$, L2$, N As Integer, kind As Integer, ar As Double
+    T = M_TYPE
+    If M_ERR$ <> "" Or M_W < 1 Or M_H < 1 Then
+        If Caption(RateInfoLB) <> "" Then SetCaption RateInfoLB, ""
+        Exit Sub
+    End If
+    vid = 0: pal = 0: aud = 0: comp = _FALSE
+    fps = Val(M_FPS$): If fps <= 0 Then fps = 15
+    Select Case T
+        Case MM_SPRITE
+            vid = M_W * M_H: If M_BITS = 4 Then vid = vid / 2
+            If M_SPI Then vid = Int((vid + 511) / 512) * 512
+            If Not M_EXT Then
+                If M_BITS = 8 Or M_SPI Then pal = 512 Else pal = 32
+            End If
+        Case MM_BITMAP
+            If M_DOJPG Then
+                comp = _TRUE
+            Else
+                vid = (M_W * M_H) / MM_BitDiv(M_BITS)
+                Select Case M_BITS
+                    Case 8: pal = 512
+                    Case 4: pal = 32
+                    Case 2: pal = 8
+                    Case 1: pal = 4
+                End Select
+                If M_PAL24 Then pal = 768
+            End If
+        Case MM_DESKTOP
+            If M_DOJPG Then
+                comp = _TRUE
+            Else
+                vid = M_W * M_H: pal = 768
+            End If
+        Case MM_SECTOR
+            vid = Int(((M_W * M_H * M_BITS) / 8 + 511) / 512) * 512
+            pal = 512
+        Case MM_VGA
+            If M_BITS = 4 Then
+                vid = (M_W * M_H) / 2: pal = 48 ' VGA 16 color: 4 bit planes, 16 x R,G,B
+            Else
+                vid = Int((M_W * M_H + 511) / 512) * 512
+                pal = 768
+            End If
+        Case MM_AMIGA
+            vid = (M_W * M_H * M_BITS) / 8
+            pal = 4 * (2 ^ (M_BITS - 1))
+    End Select
+    hasAud = MM_Chk(InterleaveCB) Or T = MM_AMIGA
+    If hasAud Then
+        kind = MM_AudioKind
+        If kind > 0 Then
+            N = MM_Sel(AudioSizeDD)
+            If N < 1 Or N > MM_ANUM Then N = MM_ADEF
+            If N >= 1 And N <= MM_ANUM Then aud = MM_AFRAME(N)
+        Else
+            ar = MM_Num(AudioRateTB)
+            If ar > 0 Then
+                If MM_Chk(Audio16CB) Then ar = ar * 2
+                If MM_Chk(AudioStereoCB) Then ar = ar * 2
+                aud = Int(ar / fps + .5)
+            End If
+        End If
+    End If
+    If comp Then
+        S$ = "Compressed frames: size varies with the picture."
+        If aud > 0 Then S$ = S$ + Chr$(10) + "Audio per frame: " + MM_Commas(aud) + " bytes"
+    Else
+        tot = vid + pal + aud
+        S$ = MM_Commas(tot) + " bytes/frame x " + M_FPS$ + " fps = " + MM_Commas(Int(tot * fps / 1024 * 10 + .5) / 10) + " KB/s  (KB = 1024)" + Chr$(10)
+        L2$ = "video " + MM_Commas(vid)
+        If pal > 0 Then L2$ = L2$ + " + palette " + MM_Commas(pal)
+        If aud > 0 Then
+            L2$ = L2$ + " + audio " + MM_Commas(aud)
+        Else
+            L2$ = L2$ + "  (audio separate)"
+        End If
+        S$ = S$ + L2$
+    End If
+    If Caption(RateInfoLB) <> S$ Then SetCaption RateInfoLB, S$
+End Sub
+
+Function MM_SpiOK%
+    Dim W As Double, H As Double, nb As Double, cols As Double, cd As Integer
+    MM_SpiOK = _FALSE
+    W = MM_Num(WTB): H = MM_Num(HTB)
+    If W <= 0 Or H <= 0 Then Exit Function
+    cd = MM_Sel(ColorDD)
+    cols = 256
+    Select Case cd
+        Case 2: cols = 240
+        Case 3: cols = 224
+        Case 4: cols = MM_Num(ColorsTB): If cols < 0 Then cols = 224
+        Case 5, 6: cols = 16
+    End Select
+    nb = (W * H) / 512
+    If nb <> Int(nb) Then Exit Function
+    If cols < 17 Then
+        If (nb / 2) <> Int(nb / 2) Then Exit Function
+    End If
+    MM_SpiOK = _TRUE
+End Function
+
+Function MM_SpriteCols#
+    Dim cols As Double
+    cols = 256
+    Select Case MM_Sel(ColorDD)
+        Case 2: cols = 240
+        Case 3: cols = 224
+        Case 4: cols = MM_Num(ColorsTB): If cols < 0 Then cols = 224
+        Case 5, 6: cols = 16
+    End Select
+    MM_SpriteCols = cols
+End Function
+
+' the folder the movie will be written to (without creating it)
+Function MM_TargetFolder$
+    Dim SP$, PD$
+    If USE_EXISTING_FRAMEFOLDER Then
+        MM_TargetFolder = NEW_TARGET_FOLDER$
+        Exit Function
+    End If
+    Select Case M_TYPE
+        Case MM_AMIGA: SP$ = "AMIGA"
+        Case MM_VGA: SP$ = "VGA"
+        Case Else
+            If M_OUTSPEC Then
+                SP$ = "DESK-VIDS"
+                If M_DOJPG Then SP$ = "DESK-VIDS" + Slash$ + "MJPG"
+            ElseIf M_TYPE = MM_BITMAP Or M_TYPE = MM_SECTOR Then
+                SP$ = "BITMAP" + Slash$ + _Trim$(Str$(M_BITS)) + "BPP"
+            Else
+                SP$ = "SPRITEVIDS" + Slash$
+                If M_BITS = 4 Then SP$ = SP$ + "4BPP" Else SP$ = SP$ + "8BPP"
+                If M_GRAY Then SP$ = "SPRITEVIDS" + Slash$ + "GRAYSCALE"
+            End If
+            If M_TYPE = MM_SECTOR Or (M_TYPE = MM_SPRITE And M_SPI) Then SP$ = "SECTORALIGNED" + Slash$ + SP$
+    End Select
+    PD$ = GetFileName$(TName$)
+    MM_TargetFolder = ProjectHome$ + Slash$ + SP$ + Slash$ + PD$ + Slash$
+End Function
+
+Sub MM_UpdateUI
+    Dim T As Integer, S As Integer, B As Integer, I As Integer
+    Dim cust As Integer, fe As Integer, haveSrc As Integer
+    Dim cd As Integer, cols As Double
+    Dim bad As Integer, fastCap As Integer, fastEff As Integer, imgk As Integer
+    Dim wEn As Integer, hEn As Integer, psEn As Integer, vgw As Long, vgh As Long
+    Dim jpgvis As Integer, promvis As Integer, tallOK As Integer
+    Dim kind As Integer, want$, nm$, mj As Integer
+    Dim thr As Integer, cropMin As Double
+    Dim palvis As Integer, pv As Integer, one As Integer
+
+    If MM_UI_BUSY Then Exit Sub
+    MM_UI_BUSY = _TRUE
+
+    NO_LIMITS = MM_Chk(NoLimitsCB)
+    ENABLE_VGA = MM_Chk(VgaCB)
+    ENABLE_AMIGA = MM_Chk(AmigaCB)
+    T = MM_Type
+
+    ' --- the unlock boxes stay on while a type that needs them is selected
+    MM_En NoLimitsCB, (T <> MM_DESKTOP)
+    MM_En VgaCB, (T <> MM_VGA)
+    MM_En AmigaCB, (T <> MM_AMIGA)
+    MM_En TypeRB4, NO_LIMITS
+    MM_En TypeRB5, ENABLE_VGA
+    MM_En TypeRB6, ENABLE_AMIGA
+
+    ' --- output type changed: new lists and defaults
+    If T <> MM_LASTTYPE Or MM_HB <> MM_LASTHB Then
+        MM_RefillForType
+        Select Case T
+            Case MM_SPRITE
+                If MM_HB Then
+                    ' high bandwidth sprites: custom size only (whole 512 byte sectors)
+                    MM_SetSel ResDD, 9
+                    MM_SetText WTB, "160": MM_SetText HTB, "128": MM_SetSel ColorDD, 2
+                Else
+                    MM_SetText WTB, "160": MM_SetText HTB, "112": MM_SetSel ColorDD, 2
+                End If
+            Case MM_BITMAP: MM_SetText WTB, "320": MM_SetText HTB, "240"
+            Case MM_SECTOR: MM_SetText WTB, "320": MM_SetText HTB, "136"
+            Case MM_DESKTOP: MM_DeskSet _TRUE
+            Case MM_AMIGA: MM_SetText WTB, "320"
+        End Select
+        MM_SetChk SectCustomCB, _FALSE
+        MM_SetChk CustomFpsCB, _FALSE
+        MM_AUDLAST$ = ""
+        MM_PALBITS = -1
+        If T = MM_VGA And FAST_HELPER_PATH$ <> "" Then MM_FASTWANT = _TRUE: MM_BADWANT = _FALSE
+        MM_LASTTYPE = T
+        MM_LASTHB = MM_HB
+    End If
+    If T = MM_DESKTOP And Src_Aspect <> MM_DESKASP Then MM_DeskSet _FALSE
+    If T = MM_SECTOR Or T = MM_BITMAP Then
+        If Not MM_BitOK(T, MM_Sel(ResDD), MM_BITSEL) Then MM_LinkSize
+    End If
+    S = MM_ResSel
+
+    ' --- bit depth driven palette list
+    B = MM_FormBits
+    If B <> MM_PALBITS Or T <> MM_PALTYPE Then
+        MM_RefillPal
+        MM_PALBITS = B: MM_PALTYPE = T
+    End If
+
+    haveSrc = MM_HaveSource
+
+    ' --- the actual numbers
+    MM_Calc
+    M_OUTSPEC = M_DESK
+    If (T = MM_BITMAP Or T = MM_SECTOR) And Not M_OUTSPEC Then
+        If ((M_W * M_H) / MM_BitDiv(M_BITS) > 61440) Or (M_BITS = 8) Or (M_W <> 320 And M_W <> 640) Then M_OUTSPEC = _TRUE
+        If T = MM_SECTOR Then M_OUTSPEC = _FALSE
+    End If
+    If T = MM_DESKTOP Then M_OUTSPEC = _TRUE
+
+    ' =========================== SOURCE ===========================
+    If USE_EXISTING_FRAMEFOLDER Then
+        MM_SetCap SrcNameLB, "Frames: " + Left$(FRAME_FOLDER$, 60)
+        MM_SetCap SrcInfoLB, "Saves to: " + Left$(NEW_TARGET_FOLDER$, 60)
+    ElseIf VIDEO_IS_PICKED And TName$ <> "" Then
+        MM_SetCap SrcNameLB, GetFileName(DName$) + GetFileExt(DName$)
+        If Src_Width > 0 Then
+            MM_SetCap SrcInfoLB, _Trim$(Str$(Src_Width)) + " x " + _Trim$(Str$(Src_Height)) + "   aspect " + Left$(_Trim$(Str$(Src_Aspect)), 5)
+        Else
+            MM_SetCap SrcInfoLB, ""
+        End If
+    Else
+        MM_SetCap SrcNameLB, "(no video selected)"
+        MM_SetCap SrcInfoLB, ""
+    End If
+    MM_En ProjTB, USE_EXISTING_FRAMEFOLDER
+    MM_En ProjLB, USE_EXISTING_FRAMEFOLDER
+    If Not USE_EXISTING_FRAMEFOLDER Then
+        If VIDEO_IS_PICKED Then MM_SetText ProjTB, GetFileName$(TName$) Else MM_SetText ProjTB, ""
+    End If
+
+    ' =========================== RESOLUTION ===========================
+    $If DESK_EDITION = TRUE Then
+        MM_Show2 ResDD, _FALSE, _FALSE ' no size list: width and height are typed in
+    $Else
+        MM_Show2 ResDD, (T <= MM_SECTOR), (Not (T = MM_SPRITE And MM_HB))
+    $End If
+    cust = M_CUSTOM
+    Select Case T
+        Case MM_SPRITE: wEn = (S = 9): hEn = wEn
+        Case MM_BITMAP: wEn = (S = 6): hEn = wEn
+        Case MM_SECTOR
+            wEn = cust And (S = 1): hEn = cust
+        Case MM_DESKTOP: wEn = _TRUE: hEn = _TRUE
+        Case MM_AMIGA: wEn = _TRUE: hEn = _FALSE
+        Case Else: wEn = _FALSE: hEn = _FALSE
+    End Select
+    MM_En WTB, wEn: MM_En WLB, wEn
+    MM_En HTB, hEn: MM_En HLB, hEn
+    If T = MM_VGA Then
+        ' the picture's own size on the VGA screen (bars are added later, not shown)
+        MM_VgaDims MM_Sel(VgaDD), vgw, vgh
+        MM_SetText WTB, _Trim$(Str$(vgw)): MM_SetText HTB, _Trim$(Str$(vgh))
+    ElseIf M_ERR$ = "" Then
+        If Not wEn Then MM_SetText WTB, _Trim$(Str$(M_W))
+        If Not hEn Then MM_SetText HTB, _Trim$(Str$(M_H))
+    End If
+    MM_Vis EncDimLB, (T = MM_VGA)
+    MM_Vis EncDimUL, (T = MM_VGA)
+    If T = MM_VGA Then MM_SizeEncUL
+    ' sector aligned sprite, custom height, VGA mode, Amiga standard
+    ' (the sector aligned box is only a display now: ticked and greyed for the High bandwidth sprite type)
+    MM_Show2 SpiCB, (T = MM_SPRITE And MM_HB), _FALSE
+    MM_SetChk SpiCB, (T = MM_SPRITE And MM_HB)
+    MM_SprInfo
+    MM_Show2 SectCustomCB, (T = MM_SECTOR), (T = MM_SECTOR And (S = 1 Or S = 2 Or S = 4))
+    If Not (T = MM_SECTOR And (S = 1 Or S = 2 Or S = 4)) Then MM_SetChk SectCustomCB, _FALSE
+    MM_Show2 VgaDD, (T = MM_VGA), _TRUE
+    MM_Show2 AmiStdDD, (T = MM_AMIGA), _TRUE
+    AMIGA_PAL = (T = MM_AMIGA And MM_Sel(AmiStdDD) = 2)
+    MM_Vis AmiHLB, (T = MM_AMIGA)
+    If T = MM_AMIGA Then
+        MM_SetCap AmiHLB, "Height is worked out from the picture shape: " + _Trim$(Str$(M_H))
+    End If
+
+    jpgvis = (T = MM_DESKTOP) Or (T = MM_BITMAP And S = 6 And NO_LIMITS)
+    promvis = (T = MM_BITMAP And S = 6 And NO_LIMITS)
+    ' MJPG and WebP are separate methods; ticking one unticks the other
+    If MM_Chk(MjpgCB) And MM_Chk(WebpCB) Then
+        If MM_WLAST Then MM_SetChk WebpCB, _FALSE Else MM_SetChk MjpgCB, _FALSE
+    End If
+    If Not jpgvis Then MM_SetChk MjpgCB, _FALSE: MM_SetChk WebpCB, _FALSE
+    MM_WLAST = MM_Chk(WebpCB)
+    MM_Show2 MjpgCB, jpgvis, _TRUE
+    MM_Show2 WebpCB, jpgvis, _TRUE
+    MM_Vis CmpLB, jpgvis
+    MM_Vis CmpNoteLB, jpgvis
+    MM_Vis JpgQLB, jpgvis
+    MM_Vis JpgQTB, jpgvis
+    MM_Vis WebpQLB, jpgvis
+    MM_Vis WebpQTB, jpgvis
+    MM_En JpgQTB, (jpgvis And MM_Chk(MjpgCB)): MM_En JpgQLB, (jpgvis And MM_Chk(MjpgCB))
+    MM_En WebpQTB, (jpgvis And MM_Chk(WebpCB)): MM_En WebpQLB, (jpgvis And MM_Chk(WebpCB))
+    MM_En CmpLB, jpgvis: MM_En CmpNoteLB, jpgvis
+    MM_PlaceCmp (T = MM_DESKTOP), jpgvis
+    MM_Show2 PromoteCB, promvis, (Not MM_CmpOn)
+    If promvis And MM_CmpOn Then MM_SetChk PromoteCB, _TRUE
+    If Not promvis Then MM_SetChk PromoteCB, _FALSE
+    If T = MM_DESKTOP Then
+        MM_Show2 Pal24CB, _TRUE, _FALSE
+        MM_SetChk Pal24CB, Not MM_CmpOn
+    ElseIf promvis Then
+        MM_Show2 Pal24CB, _TRUE, (MM_Chk(PromoteCB) And Not MM_CmpOn)
+        If Not (MM_Chk(PromoteCB) And Not MM_CmpOn) Then MM_SetChk Pal24CB, _FALSE
+    Else
+        MM_Vis Pal24CB, _FALSE
+        MM_SetChk Pal24CB, _FALSE
+    End If
+    tallOK = (T = MM_BITMAP Or T = MM_SECTOR Or T = MM_DESKTOP) And (Src_Aspect > 0) And (Src_Aspect < 1) And (M_W = 320 Or M_DESK Or T = MM_DESKTOP)
+    If T = MM_VGA And Src_Aspect > 0 And Src_Aspect < 1 Then
+        ' VGA portrait video: always marked TALL, can not be switched off
+        MM_Show2 TallCB, _TRUE, _FALSE
+        MM_SetChk TallCB, _TRUE
+        MM_TALLLAST = _FALSE
+    Else
+        MM_Show2 TallCB, _TRUE, tallOK
+        If tallOK And Not MM_TALLLAST Then MM_SetChk TallCB, _TRUE
+        If Not tallOK Then MM_SetChk TallCB, _FALSE
+        MM_TALLLAST = tallOK
+    End If
+    ' keep original aspect box: on the row of the TALL box, for the types that carry an aspect
+    MM_Show2 AspectCB, (T = MM_BITMAP Or T = MM_SECTOR Or T = MM_DESKTOP), _TRUE
+    Control(AspectCB).Top = Control(TallCB).Top
+
+    ' =========================== COLOR ===========================
+    MM_Show2 ColorDD, (T = MM_SPRITE), _TRUE
+    cd = MM_Sel(ColorDD)
+    cols = MM_SpriteCols
+    MM_Show2 BitsLB, _TRUE, _TRUE
+    Dim bitsNow As Integer, bEn1 As Integer, bEn2 As Integer, bEn4 As Integer, bEn8 As Integer
+    bitsNow = MM_BITSEL
+    bEn1 = _FALSE: bEn2 = _FALSE: bEn4 = _FALSE: bEn8 = _FALSE
+    Select Case T
+        Case MM_SPRITE
+            If cd = 5 Or cd = 6 Then bitsNow = 4 Else bitsNow = 8
+            bEn4 = _TRUE: bEn8 = _TRUE
+        Case MM_BITMAP
+            If promvis And MM_Chk(PromoteCB) Then
+                bitsNow = 8
+            Else
+                If bitsNow = 8 Then bitsNow = 4: MM_BITSEL = 4
+                bEn1 = _TRUE: bEn2 = _TRUE: bEn4 = _TRUE
+            End If
+        Case MM_AMIGA
+            If bitsNow = 8 Then bitsNow = 4: MM_BITSEL = 4
+            bEn1 = _TRUE: bEn2 = _TRUE: bEn4 = _TRUE
+        Case MM_SECTOR
+            bEn1 = _TRUE: bEn2 = _TRUE: bEn4 = _TRUE: bEn8 = _TRUE
+        Case MM_VGA
+            ' 4 bit = the VGA 16 color choice of the VGA drop down, 8 bit = the 256 color modes
+            If MM_Sel(VgaDD) = 4 Then bitsNow = 4 Else bitsNow = 8
+            bEn4 = _TRUE: bEn8 = _TRUE
+        Case Else
+            bitsNow = 8
+    End Select
+    MM_Show2 BitRB1, _TRUE, bEn1
+    MM_Show2 BitRB2, _TRUE, bEn2
+    MM_Show2 BitRB3, _TRUE, bEn4
+    MM_Show2 BitRB4, _TRUE, bEn8
+    MM_SetChk BitRB1, (bitsNow = 1)
+    MM_SetChk BitRB2, (bitsNow = 2)
+    MM_SetChk BitRB3, (bitsNow = 4)
+    MM_SetChk BitRB4, (bitsNow = 8)
+    palvis = (B < 8) And (T = MM_BITMAP Or T = MM_SECTOR Or T = MM_AMIGA Or T = MM_SPRITE)
+    If T = MM_BITMAP And promvis And MM_Chk(PromoteCB) Then palvis = _FALSE
+    MM_Show2 PalLB, palvis, _TRUE
+    MM_Show2 PalDD, palvis, _TRUE
+    pv = COLOR_MODE
+    If palvis And MM_PalN > 0 Then
+        I = MM_Sel(PalDD): If I > MM_PalN Then I = 1
+        pv = MM_PalVal(I)
+    End If
+    one = (palvis And B = 1)
+    MM_Show2 C1FgBtn, _TRUE, one
+    MM_Show2 C1BgBtn, _TRUE, one
+    MM_Vis C1PB, (one And pv <> COLOR_MODE)
+    If one And pv <> COLOR_MODE Then
+        Dim sFg As _Unsigned Long, sBg As _Unsigned Long
+        sFg = _RGB32(255, 255, 255): sBg = _RGB32(0, 0, 0)
+        Select Case pv
+            Case CUST_1BPP
+                If MM_C1SET = 0 Then MM_C1FG = _RGB32(255, 255, 255, 255): MM_C1BG = _RGB32(0, 0, 0, 255): MM_C1SET = _TRUE
+                sFg = MM_C1FG: sBg = MM_C1BG
+            Case GREEN_MODE: sFg = _RGB32(64, 255, 64)
+            Case AMBER_MODE: sFg = _RGB32(255, 176, 0)
+        End Select
+        MM_Draw1BitPreview sFg, sBg
+    End If
+    MM_Show2 ColorsLB, (T = MM_SPRITE Or T = MM_SECTOR), (T = MM_SPRITE And cd = 4) Or (T = MM_SECTOR And S = 4)
+    MM_Show2 ColorsTB, (T = MM_SPRITE Or T = MM_SECTOR), (T = MM_SPRITE And cd = 4) Or (T = MM_SECTOR And S = 4)
+    psEn = _FALSE
+    If T = MM_SPRITE Then psEn = (M_BITS = 8 And cols > 16 And cols < 256 And Not MM_Chk(ExtPalCB))
+    If T = MM_SECTOR Then psEn = (M_BITS = 8)
+    MM_Show2 PalShiftCB, (T = MM_SPRITE Or T = MM_SECTOR), psEn
+    If psEn And Not MM_PSLAST Then MM_SetChk PalShiftCB, (T = MM_SPRITE Or T = MM_SECTOR)
+    If Not psEn Then MM_SetChk PalShiftCB, _FALSE
+    MM_PSLAST = psEn
+    ' static palette (sprite videos only)
+    MM_Show2 ExtPalCB, (T = MM_SPRITE), _TRUE
+    If T <> MM_SPRITE Then MM_SetChk ExtPalCB, _FALSE
+    MM_Show2 ExtMethodDD, (T = MM_SPRITE), MM_Chk(ExtPalCB)
+    MM_Show2 SaveMapCB, (T = MM_SPRITE), MM_Chk(ExtPalCB)
+    MM_Show2 FfColorCB, (T = MM_SPRITE), (MM_Chk(ExtPalCB) And MM_Sel(ExtMethodDD) > 2)
+    If Not MM_Chk(ExtPalCB) Then MM_SetChk SaveMapCB, _FALSE: MM_SetChk FfColorCB, _FALSE
+    If MM_Sel(ExtMethodDD) <= 2 Then MM_SetChk FfColorCB, _FALSE
+
+    ' =========================== TIMING & AUDIO ===========================
+    fe = (T = MM_SECTOR Or T = MM_DESKTOP Or T = MM_VGA Or T = MM_AMIGA) Or (T = MM_SPRITE And S = 9) Or (T = MM_BITMAP And S = 6)
+    MM_Show2 CustomFpsCB, _TRUE, fe
+    If Not fe Then MM_SetChk CustomFpsCB, _FALSE
+    MM_Show2 FpsTB, _TRUE, (fe And MM_Chk(CustomFpsCB))
+    If Not (fe And MM_Chk(CustomFpsCB)) Then
+        If M_ERR$ = "" Then MM_SetText FpsTB, M_FPS$
+    End If
+    If fe Then
+        MM_SetCap FpsInfoLB, "default " + M_DEFFPS$
+    Else
+        MM_SetCap FpsInfoLB, "set by the size"
+    End If
+    If T = MM_AMIGA Then MM_SetChk InterleaveCB, _TRUE
+    MM_Show2 InterleaveCB, _TRUE, (T <> MM_AMIGA)
+    MM_Show2 Audio16CB, _TRUE, (T <> MM_VGA And T <> MM_AMIGA)
+    MM_Show2 AudioStereoCB, _TRUE, (T <> MM_VGA And T <> MM_AMIGA)
+    $If DESK_EDITION = TRUE Then
+        MM_Show2 AudNoteLB, _FALSE, _TRUE ' (the note is about the X16)
+    $Else
+        MM_Show2 AudNoteLB, (T <> MM_VGA And T <> MM_AMIGA), _TRUE
+    $End If
+    If T = MM_VGA Or T = MM_AMIGA Then MM_SetChk Audio16CB, _FALSE: MM_SetChk AudioStereoCB, _FALSE
+    kind = MM_AudioKind
+    MM_Vis AudioRateLB, (kind = 0): MM_Vis AudioRateTB, (kind = 0)
+    MM_Vis AudioSizeLB, (kind > 0): MM_Vis AudioSizeDD, (kind > 0)
+    If kind = 0 Then
+        If M_DESK Or T = MM_DESKTOP Then want$ = "48000" Else want$ = "16044"
+        If _Trim$(Text(AudioRateTB)) = MM_RATEDEF$ Or _Trim$(Text(AudioRateTB)) = "" Then MM_SetText AudioRateTB, want$
+        MM_RATEDEF$ = want$
+    Else
+        MM_FillAudioList
+        If kind = 2 Then MM_SetCap AudioSizeLB, "Amiga audio rate" Else MM_SetCap AudioSizeLB, "Audio frame size"
+    End If
+    MM_RateInfo
+    MM_CropList
+    If T = MM_VGA Then cropMin = 1.4 Else cropMin = 1.35
+    MM_Show2 CropLB, _TRUE, (Src_Aspect > cropMin And VIDEO_IS_PICKED)
+    MM_Show2 CropDD, _TRUE, (Src_Aspect > cropMin And VIDEO_IS_PICKED)
+    If Not (Src_Aspect > cropMin And VIDEO_IS_PICKED) Then MM_SetSel CropDD, 1
+
+    ' =========================== ENGINE ===========================
+    bad = (MM_BADWANT And CX16_IMG_AVAILABLE)
+    mj = MM_CmpOn
+    MM_Show2 BadmaiCB, _TRUE, (CX16_IMG_AVAILABLE And Not mj)
+    MM_SetChk BadmaiCB, bad
+    MM_BADLAST = bad
+    fastCap = MM_FastApplies Or (FAST_HELPER_PATH$ <> "" And MM_FastCapable)
+    fastEff = MM_FASTWANT And Not bad
+    MM_Show2 FastCB, _TRUE, (FAST_HELPER_PATH$ <> "" And Not bad And Not mj)
+    MM_SetChk FastCB, fastEff
+    MM_FASTLAST = fastEff
+    imgk = Not bad And Not (fastEff And fastCap)
+    MM_Show2 ImagickCB, _TRUE, (Not mj)
+    MM_SetChk ImagickCB, Not bad
+    MM_IMGLAST = Not bad
+    $If DESK_EDITION = TRUE Then
+        ' desktop edition: the BADMAI controls and the ImageMagick controls share the same rows,
+        ' so each group is hidden (not just greyed) while it does not apply
+        MM_Show2 YoloCB, bad, bad
+        If Not bad Then MM_SetChk YoloCB, _FALSE
+        MM_Show2 BadmaiXLB, bad, bad: MM_Show2 BadmaiXTB, bad, bad
+        MM_Show2 MagickLB, imgk, imgk: MM_Show2 MagickTB, imgk, imgk
+        MM_Show2 DitherLB, imgk, imgk
+        MM_Show2 DitherDD, imgk, imgk
+        MM_Show2 DitherTB, (imgk And MM_Sel(DitherDD) = 11), (imgk And MM_Sel(DitherDD) = 11)
+    $Else
+        MM_Show2 YoloCB, _TRUE, bad
+        If Not bad Then MM_SetChk YoloCB, _FALSE
+        MM_Show2 BadmaiXLB, _TRUE, bad: MM_Show2 BadmaiXTB, _TRUE, bad
+        MM_Show2 MagickLB, _TRUE, imgk: MM_Show2 MagickTB, _TRUE, imgk
+        MM_Show2 DitherLB, _TRUE, imgk
+        MM_Show2 DitherDD, _TRUE, imgk
+        MM_Show2 DitherTB, _TRUE, (imgk And MM_Sel(DitherDD) = 11)
+    $End If
+    MM_Show2 PreFilterTB, _TRUE, MM_Chk(PreFilterCB)
+
+    ' =========================== OUTPUT ===========================
+    MM_Show2 DeleteCB, _TRUE, NEW_VIDEO_PROJECT And VIDEO_IS_PICKED
+    MM_SetChk DeleteCB, (NEW_VIDEO_PROJECT And VIDEO_IS_PICKED And Not MM_DELOFF)
+    MM_Show2 TestPlayCB, _TRUE, USE_VIDEO_PLAYER
+    If Not USE_VIDEO_PLAYER Then MM_SetChk TestPlayCB, _FALSE
+    MM_Show2 PartSizeDD, _TRUE, MM_Chk(SplitCB)
+    MM_Show2 PartSizeLB, _TRUE, MM_Chk(SplitCB)
+    MM_Show2 PartsPrevCB, _TRUE, (MM_Chk(SplitCB) And USE_VIDEO_PLAYER And USE_ASK_PLAYER)
+    If Not (MM_Chk(SplitCB) And USE_VIDEO_PLAYER And USE_ASK_PLAYER) Then MM_SetChk PartsPrevCB, _FALSE
+    If haveSrc Then
+        nm$ = MM_AutoName
+        If _Trim$(Text(OutTB)) = "" Or Text(OutTB) = MM_LASTAUTO$ Then MM_SetText OutTB, nm$
+        MM_LASTAUTO$ = nm$
+        If M_ERR$ = "" Then MM_SetCap TargetLB, "Saves to: " + Left$(MM_TargetFolder$, 56)
+    Else
+        MM_SetCap TargetLB, ""
+    End If
+
+    ' =========================== STATUS / CONVERT BUTTON ===========================
+    If Not MM_DEPS_OK Then
+        MM_Status "Missing programs - see the message at start up."
+    ElseIf Not haveSrc Then
+        MM_Status "Choose a video (or existing frames) to begin."
+    ElseIf M_ERR$ <> "" Then
+        MM_Status "Check: " + Replace$(M_ERR$, CRLF, " ", True, 0)
+    Else
+        MM_Status MM_Summary$
+    End If
+    MM_En ConvertBtn, (haveSrc And MM_DEPS_OK And M_ERR$ = "")
+
+    MM_UI_BUSY = _FALSE
+End Sub
+
+' like MM_FastApplies but ignoring the BADMAI check box
+Function MM_FastCapable%
+    Dim T As Integer
+    T = MM_Type
+    MM_FastCapable = _FALSE
+    Select Case T
+        Case MM_SPRITE
+            If MM_Chk(ExtPalCB) Then Exit Function
+            If MM_SpriteCols < 17 Then Exit Function
+            MM_FastCapable = _TRUE
+        Case MM_BITMAP
+            If MM_Sel(ResDD) = 6 And Control(PromoteCB).Hidden = 0 And MM_Chk(PromoteCB) Then MM_FastCapable = _TRUE
+        Case MM_SECTOR
+            MM_FastCapable = (M_BITS = 8)
+        Case MM_DESKTOP
+            MM_FastCapable = _TRUE
+        Case MM_VGA
+            MM_FastCapable = (MM_Sel(VgaDD) <> 4)
+    End Select
+End Function
+
+Function MM_Summary$
+    Dim S$
+    Select Case M_TYPE
+        Case MM_SPRITE
+            If M_SPI Then S$ = "X16 high bandwidth sprite video  " Else S$ = "X16 sprite video  "
+        Case MM_BITMAP: S$ = "X16 bitmap video  "
+        Case MM_SECTOR: S$ = "X16 high bandwidth video  "
+        Case MM_DESKTOP: S$ = "Desktop video  "
+        Case MM_VGA: S$ = "VGA video  "
+        Case MM_AMIGA: S$ = "Amiga video  "
+    End Select
+    S$ = S$ + _Trim$(Str$(M_W)) + " x " + _Trim$(Str$(M_H)) + "   " + _Trim$(Str$(M_BITS)) + " bit   " + M_FPS$ + " fps"
+    If ASPECT_NOTE$ <> "" Then S$ = S$ + "   [" + ASPECT_NOTE$ + "]"
+    If ASPECT_WARN$ <> "" Then S$ = S$ + "   Note: " + _Trim$(ASPECT_WARN$)
+    MM_Summary = S$
+End Function
+
+
+' A scaled picture (test1bpp.bmp) in the chosen foreground / background colors, in a sunken box
+Sub MM_Draw1BitPreview (fg As _Unsigned Long, bg As _Unsigned Long)
+    Static src As Long, small As Long, lastFg As _Unsigned Long, lastBg As _Unsigned Long, have As Integer
+    Static sw As Long, sh As Long
+    Static gray() As _Unsigned _Byte
+    Dim w As Long, h As Long, SD As Long, x As Long, y As Long, ox As Long, oy As Long, g As Long
+    Dim r As Long, gg As Long, b As Long, p As _Unsigned Long
+    If have And lastFg = fg And lastBg = bg Then Exit Sub
+    w = Control(C1PB).Width: h = Control(C1PB).Height
+    If sw = 0 Then
+        src = _LoadImage(_Embedded$("testIMG1BPP"), 32, "MEMORY")
+        If src >= -1 Then Exit Sub
+        sh = h - 6
+        sw = _Round(sh * 4 / 3)
+        small = _NewImage(sw, sh, 32)
+        _PutImage (0, 0)-(sw - 1, sh - 1), src, small, , _Smooth
+        ReDim gray(0 To sw * sh - 1) As _Unsigned _Byte
+        _Source small
+        For y = 0 To sh - 1
+            For x = 0 To sw - 1
+                p = Point(x, y)
+                gray(y * sw + x) = _Red32(p)
+            Next
+        Next
+        _Source 0
+    End If
+    SD = _Dest
+    If Control(C1PB).HelperCanvas >= -1 Then
+        Control(C1PB).HelperCanvas = _NewImage(w, h, 32)
+    ElseIf _Width(Control(C1PB).HelperCanvas) <> w Or _Height(Control(C1PB).HelperCanvas) <> h Then
+        _FreeImage Control(C1PB).HelperCanvas
+        Control(C1PB).HelperCanvas = _NewImage(w, h, 32)
+    End If
+    BeginDraw C1PB
+    Cls , _RGB32(120, 120, 120)
+    ox = (w - sw) \ 2: oy = (h - sh) \ 2
+    For y = 0 To sh - 1
+        For x = 0 To sw - 1
+            g = gray(y * sw + x)
+            r = _Red32(bg) + (_Red32(fg) - _Red32(bg)) * g / 255
+            gg = _Green32(bg) + (_Green32(fg) - _Green32(bg)) * g / 255
+            b = _Blue32(bg) + (_Blue32(fg) - _Blue32(bg)) * g / 255
+            PSet (ox + x, oy + y), _RGB32(r, gg, b)
+        Next
+    Next
+    ' sunken border around the picture box: dark top / left, light bottom / right
+    Line (0, 0)-(w - 1, 0), _RGB32(90, 90, 90)
+    Line (0, 0)-(0, h - 1), _RGB32(90, 90, 90)
+    Line (1, 1)-(w - 2, 1), _RGB32(150, 150, 150)
+    Line (1, 1)-(1, h - 2), _RGB32(150, 150, 150)
+    Line (0, h - 1)-(w - 1, h - 1), _RGB32(250, 250, 250)
+    Line (w - 1, 0)-(w - 1, h - 1), _RGB32(250, 250, 250)
+    Line (1, h - 2)-(w - 2, h - 2), _RGB32(210, 210, 210)
+    Line (w - 2, 1)-(w - 2, h - 2), _RGB32(210, 210, 210)
+    EndDraw C1PB
+    If SD < -1 Or SD = 0 Then _Dest SD
+    lastFg = fg: lastBg = bg: have = _TRUE
+    Control(C1PB).Redraw = True
+End Sub
+
+' MJPG or WebP chosen (the 24 bit frame methods)
+Function MM_CmpOn%
+    MM_CmpOn = (MM_Chk(MjpgCB) Or MM_Chk(WebpCB))
+End Function
+
+' vertical placement of the Resolution box items that depend on the output type
+Sub MM_PlaceCmp (desk As Integer, jpgShown As Integer)
+    Dim b As Long
+    $If DESK_EDITION = TRUE Then
+        ' desktop edition: width / height on the top row for both types (no size list above them)
+        Control(WTB).Top = DK_WH_TOP: Control(WLB).Top = DK_WH_LBL
+        Control(HTB).Top = DK_WH_TOP: Control(HLB).Top = DK_WH_LBL
+        If desk Then
+            Control(Pal24CB).Top = DK_PAL24_DESK
+            b = DK_B_DESK
+        Else
+            Control(PromoteCB).Top = DK_PROMOTE_TOP
+            Control(Pal24CB).Top = DK_PAL24_PAL
+            b = DK_B_PAL
+        End If
+        Control(CmpLB).Top = b
+        Control(MjpgCB).Top = b + 28: Control(JpgQTB).Top = b + 27: Control(JpgQLB).Top = b + 29
+        Control(WebpCB).Top = b + 58: Control(WebpQTB).Top = b + 57: Control(WebpQLB).Top = b + 59
+        Control(CmpNoteLB).Top = b + 88
+        Control(TallCB).Top = b + DK_TALL_GAP
+        Exit Sub
+    $End If
+    If desk Then
+        ' width / height level with the Choose Video buttons
+        Control(WTB).Top = 25: Control(WLB).Top = 27
+        Control(HTB).Top = 25: Control(HLB).Top = 27
+        Control(Pal24CB).Top = 60
+        b = 94
+    Else
+        Control(WTB).Top = 57: Control(WLB).Top = 59
+        Control(HTB).Top = 57: Control(HLB).Top = 59
+        Control(PromoteCB).Top = 86
+        Control(Pal24CB).Top = 110
+        b = 136
+    End If
+    Control(CmpLB).Top = b
+    Control(MjpgCB).Top = b + 24: Control(JpgQTB).Top = b + 23: Control(JpgQLB).Top = b + 24
+    Control(WebpCB).Top = b + 50: Control(WebpQTB).Top = b + 49: Control(WebpQLB).Top = b + 50
+    Control(CmpNoteLB).Top = b + 76
+    If desk Then Control(TallCB).Top = b + 108 Else If jpgShown Then Control(TallCB).Top = b + 94 Else Control(TallCB).Top = 228
+End Sub
+
+' Desktop video default size: 640 wide (512 for a portrait source), height from the source shape (even number).
+' Sizes that were typed in by hand are kept; only untouched defaults follow a newly chosen video.
+Sub MM_DeskSet (force As Integer)
+    Dim w As Long, h As Long, w$, h$
+    w = 640
+    If Src_Aspect > 0 And Src_Aspect < 1 Then w = 512
+    If Src_Aspect > 0 Then h = Int(w / Src_Aspect / 2 + .5) * 2 Else h = 480
+    If h < 16 Then h = 16
+    w$ = _Trim$(Str$(w)): h$ = _Trim$(Str$(h))
+    If force Or (_Trim$(Text(WTB)) = MM_DESKAW$ And _Trim$(Text(HTB)) = MM_DESKAH$) Then
+        MM_SetText WTB, w$: MM_SetText HTB, h$
+    End If
+    MM_DESKAW$ = w$: MM_DESKAH$ = h$
+    MM_DESKASP = Src_Aspect
+End Sub
+
+' size of the picture itself on the VGA screen.  sel: 1 = Mode 13h, 2 = Mode X 320x200, 3 = Mode X 320x240
+' The screen is 4:3.  The 200 line modes have tall pixels, so a 240 line square pixel picture is squeezed by 200/240.
+Sub MM_VgaDims (sel As Integer, w As Long, h As Long)
+    Dim sh As Long, a As Double
+    If sel = 3 Then sh = 240 Else sh = 200
+    a = Src_Aspect
+    w = 320: h = sh
+    If a <= 0 Then Exit Sub
+    ' the crop choice reshapes a wide picture (a narrow one is always padded)
+    If a >= 1.3 Then
+        Select Case Control(CropDD).Value
+            Case 2, 3: a = 4 / 3
+            Case 4: If a > 16 / 9 Then a = 16 / 9
+        End Select
+    End If
+    If a < 1.3 Then
+        ' narrow (portrait) picture centered between black bars
+        w = Int(240 * a / 2 + .5) * 2
+        If w < 16 Then w = 16
+    ElseIf a > 1.4 Then
+        h = _Round(320 / a)
+        If sh = 200 Then h = _Round(h * (200 / 240))
+    End If
+End Sub
+
+' underline for the "Encoded Video Dimensions" heading: as wide as the text, measured once
+Sub MM_SizeEncUL
+    Static done As Integer
+    Dim tmp As Long, w As Long
+    If done Then Exit Sub
+    done = _TRUE
+    Control(EncDimUL).BorderColor = Control(EncDimLB).ForeColor
+    Control(EncDimUL).BackColor = Control(EncDimLB).ForeColor
+    tmp = _NewImage(16, 16, 32)
+    If Control(EncDimLB).Font > 0 Then _Font Control(EncDimLB).Font, tmp
+    w = _PrintWidth("Encoded Video Dimensions", tmp)
+    _FreeImage tmp
+    If w > 20 And w < 330 Then Control(EncDimUL).Width = w
+End Sub

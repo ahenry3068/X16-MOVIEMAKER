@@ -1,0 +1,155 @@
+' =============================================================================
+'  Picture shape ("aspect") handling for X16 and Desktop videos
+'
+'  The "Keep original aspect" box (AspectCB).  When it is ticked the video is
+'  shown on the X16 / Desktop in the shape of the source, never stretched:
+'
+'     source aspect (width / height, after any crop option)
+'        1.28 - 1.40     4:3      HINT "N"   (as before)
+'        1.70 - 1.90     16:9     HINT "W"   (as before)
+'        0.50 - 0.60     9:16     "K" type   (as before)
+'        any other       HINT "A" + the aspect as a 5 byte CBM float in EXTRA
+'                        bytes 2 - 6 (the first EXTRA byte keeps its old meaning)
+'        portrait X16    "K" type, the picture padded to 9:16 with black bars
+'
+'  Desktop only videos (EXTRA byte 1 = "X", or MJPG) always get "A".
+'
+'  The X16 shows an "A" video in a window on the 640 x 480 screen:
+'     aspect >= 4:3   640 wide,  640 / aspect lines  (even number)
+'     aspect <  4:3   480 high,  480 * aspect columns (multiple of 8)
+'  A frame can be stretched by the hardware scale (128 = 1:1) but never made
+'  smaller than 1:1, so a frame can not have more lines (or columns) than its
+'  window.  The scales are whole numbers, rounded DOWN, so the picture ends up
+'  a little larger than the window (a few edge lines or columns are lost).
+' =============================================================================
+
+' picture shape the converter works with: the source shape, or what a crop option makes of it
+Function MM_EffAspect#
+    Dim a As Double
+    a = Src_Aspect
+    Select Case MM_CROPSEL
+        Case 1, 2, 4: a = 4 / 3
+        Case 3: a = 16 / 9
+    End Select
+    MM_EffAspect = a
+End Function
+
+' what the X16 player will see: the aspect after it went through the 5 byte float
+Function MM_AspectStored# (a As Double)
+    MM_AspectStored = MM_CBM5ToDouble(MM_CBM5(a))
+End Function
+
+Function MM_WinLines& (a As Double)
+    Dim L As Long
+    If a >= 4 / 3 Then L = Int(640 / a + .001) Else L = 480
+    If L > 480 Then L = 480
+    MM_WinLines = (L \ 2) * 2
+End Function
+
+Function MM_WinCols& (a As Double)
+    Dim C As Long
+    If a >= 4 / 3 Then
+        C = 640
+    Else
+        C = Int(480 * a + .001)
+    End If
+    MM_WinCols = (C \ 8) * 8
+End Function
+
+Function MM_KeepAspectFor% (T As Integer)
+    MM_KeepAspectFor = (MM_Chk(AspectCB) And (T = MM_BITMAP Or T = MM_SECTOR Or T = MM_DESKTOP) And Src_Aspect > 0)
+End Function
+
+' an X16 bitmap video that gets HINT "A" (not desktop only, shape outside the 4:3 / 16:9 / portrait ranges)
+Function MM_AspectIsA% (T As Integer)
+    Dim a As Double
+    MM_AspectIsA = _FALSE
+    If Not MM_KeepAspectFor(T) Then Exit Function
+    If T = MM_DESKTOP Then Exit Function
+    a = MM_EffAspect
+    If a < 1 Then Exit Function
+    If a >= ASP_N_LO And a <= ASP_N_HI Then Exit Function
+    If a >= ASP_W_LO And a <= ASP_W_HI Then Exit Function
+    MM_AspectIsA = _TRUE
+End Function
+
+' most frame lines the X16 window of the current picture shape can show (480 when not limited)
+Function MM_AspectMaxLines& (T As Integer)
+    MM_AspectMaxLines = 480
+    If Not MM_AspectIsA(T) Then Exit Function
+    MM_AspectMaxLines = MM_WinLines(MM_AspectStored(MM_EffAspect))
+End Function
+
+Function MM_AspectFmt$ (a As Double)
+    MM_AspectFmt = Left$(_Trim$(Str$(_Round(a * 1000) / 1000)), 5)
+End Function
+
+' called by MM_Calc once the frame size of the chosen type is known.
+' Sets KEEP_ASPECT, ASPECT_A, ASPECT_VAL, ASPECT_NOTE$ and ASPECT_WARN$, may lower M_H, may set M_ERR$.
+Sub MM_AspectCalc (T As Integer)
+    Dim a As Double, aSt As Double
+    Dim winL As Long, winC As Long, sv As Long, sh As Long
+    Dim cut As Double, oldH As Long
+
+    KEEP_ASPECT = _FALSE: ASPECT_A = _FALSE: ASPECT_VAL = 0
+    ASPECT_NOTE$ = "": ASPECT_WARN$ = ""
+    If M_ERR$ <> "" Then Exit Sub
+    KEEP_ASPECT = MM_KeepAspectFor(T)
+    If Not KEEP_ASPECT Then Exit Sub
+    a = MM_EffAspect
+    ASPECT_VAL = a
+
+    ' ---- Desktop only: always the true aspect
+    If T = MM_DESKTOP Or M_DESK Then
+        ASPECT_A = _TRUE
+        ASPECT_NOTE$ = "aspect " + MM_AspectFmt$(a)
+        Exit Sub
+    End If
+
+    ' ---- portrait: the K type, padded to 9:16 when the picture is not close to it
+    If a < 1 Then
+        If Control(TallCB).Disabled = 0 And MM_Chk(TallCB) Then
+            If a < ASP_K_LO Or a > ASP_K_HI Then ASPECT_NOTE$ = "portrait, padded to 9:16" Else ASPECT_NOTE$ = "9:16"
+        Else
+            ASPECT_NOTE$ = "portrait"
+        End If
+        Exit Sub
+    End If
+
+    If a >= ASP_N_LO And a <= ASP_N_HI Then ASPECT_NOTE$ = "4:3": Exit Sub
+    If a >= ASP_W_LO And a <= ASP_W_HI Then ASPECT_NOTE$ = "16:9": Exit Sub
+
+    ' ---- HINT "A": true aspect, X16 window
+    ASPECT_A = _TRUE
+    aSt = MM_AspectStored(a)
+    ASPECT_VAL = aSt
+    winL = MM_WinLines(aSt): winC = MM_WinCols(aSt)
+    ASPECT_NOTE$ = "aspect " + MM_AspectFmt$(a) + ", window " + _Trim$(Str$(winC)) + " x " + _Trim$(Str$(winL))
+
+    If aSt < 4 / 3 And M_W > winC Then
+        M_ERR$ = "A " + _Trim$(Str$(M_W)) + " wide bitmap can not show this picture shape (" + MM_AspectFmt$(a) + ")." + CRLF + "The window is only " + _Trim$(Str$(winC)) + " columns wide.  Choose a 320 wide size, or untick Keep original aspect."
+        Exit Sub
+    End If
+    If M_H > winL Then
+        If T = MM_BITMAP And Not M_CUSTOM Then
+            ' a standard size: use the lines the window has
+            oldH = M_H
+            M_H = winL
+            ASPECT_WARN$ = "frame height lowered from " + _Trim$(Str$(oldH)) + " to " + _Trim$(Str$(M_H)) + " lines for this picture shape"
+            M_DEFFPS$ = MM_RateFor(M_W, M_H, M_BITS, _FALSE, _TRUE, _FALSE, M_DESK)
+        Else
+            M_ERR$ = "This picture shape (" + MM_AspectFmt$(a) + ") has only " + _Trim$(Str$(winL)) + " lines on the X16 screen." + CRLF + "The frame height (" + _Trim$(Str$(M_H)) + ") must be " + _Trim$(Str$(winL)) + " or less, or untick Keep original aspect."
+            Exit Sub
+        End If
+    End If
+
+    ' ---- scales are whole numbers rounded down: the picture can be a little larger than the window
+    sv = Int(M_H * 128 / winL)
+    sh = Int(M_W * 128 / winC)
+    If sv < 1 Or sh < 1 Then Exit Sub
+    cut = (M_H * 128 / sv) - winL
+    If cut >= 1 Then ASPECT_WARN$ = ASPECT_WARN$ + "  up to " + _Trim$(Str$(Int(cut))) + " bottom lines may be cut"
+    cut = (M_W * 128 / sh) - winC
+    If cut >= 1 Then ASPECT_WARN$ = ASPECT_WARN$ + "  up to " + _Trim$(Str$(Int(cut))) + " edge columns may be cut"
+    If (winL Mod 2) <> 0 Or (winC Mod 8) <> 0 Then ASPECT_WARN$ = ASPECT_WARN$ + "  window not centered exactly"
+End Sub

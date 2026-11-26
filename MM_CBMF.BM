@@ -1,0 +1,40 @@
+' =============================================================================
+'  5 byte Commodore (CBM / X16 BASIC / Prog8) floating point numbers
+'
+'    byte 1       exponent, bias 129  (0 = the number zero)
+'    bytes 2-5    31 bit fraction of the mantissa, MSB first; the leading 1 is
+'                 implied.  Bit 7 of byte 2 is the sign (always 0 here).
+'
+'  Used for the display aspect ratio stored in the SPV header (HINT "A").
+'  The same format is read by the Desktop player (C64FloatToDouble##) and is
+'  what an X16 program sees in a Prog8 "&float" mapped over those 5 bytes.
+' =============================================================================
+
+Function MM_CBM5$ (v As Double)
+    Dim e As Long, m As Double, mi As _Integer64
+    If v <= 0 Then MM_CBM5 = String$(5, 0): Exit Function
+    e = Int(Log(v) / Log(2))
+    m = v / (2 ^ e)
+    ' Log() is not exact at powers of two: settle the mantissa into 1 <= m < 2
+    Do While m >= 2
+        m = m / 2: e = e + 1
+    Loop
+    Do While m < 1
+        m = m * 2: e = e - 1
+    Loop
+    mi = _Round((m - 1) * 2147483648#)
+    If mi >= 2147483648# Then mi = 0: e = e + 1 ' rounding carried into the leading 1
+    e = e + 129
+    If e < 1 Or e > 255 Then MM_CBM5 = String$(5, 0): Exit Function
+    MM_CBM5 = Chr$(e) + Chr$((mi \ 16777216) And 127) + Chr$((mi \ 65536) And 255) + Chr$((mi \ 256) And 255) + Chr$(mi And 255)
+End Function
+
+Function MM_CBM5ToDouble# (s$)
+    Dim e As Long, mi As _Integer64
+    MM_CBM5ToDouble = 0
+    If Len(s$) < 5 Then Exit Function
+    If Asc(s$, 1) = 0 Then Exit Function
+    e = Asc(s$, 1) - 129
+    mi = (Asc(s$, 2) And 127) * 16777216 + Asc(s$, 3) * 65536& + Asc(s$, 4) * 256& + Asc(s$, 5)
+    MM_CBM5ToDouble = (1 + mi / 2147483648#) * (2 ^ e)
+End Function

@@ -1,0 +1,1262 @@
+' MM_RUN.BM -- applies the form to the converter and runs a conversion.
+' This is the old menu code (MAIN_MENU, the resolution menus, SetUpMovieParameters and the
+' START_ME_UP flow) with every question replaced by the value of a control on the form.
+
+Dim Shared MM_DONE As Integer
+Dim Shared MM_OK As Integer
+Dim Shared MM_CONV_NAME$
+
+' ---------------------------------------------------------------------------------
+'  Functions the engine still calls, now answered from the form
+' ---------------------------------------------------------------------------------
+Function MM_FrameRate$
+    MM_FrameRate = M_FPS$
+End Function
+
+Function Make_SectorAligned_AUDIO&
+    Dim N As Integer
+    If FOR_VGA Then
+        ENABLE_16BIT_PCM = _FALSE
+        ENABLE_STEREO_PCM = _FALSE
+    End If
+    MM_BuildAudioChoices 1, Val(MovieFPS$), ENABLE_16BIT_PCM, ENABLE_STEREO_PCM
+    If MM_AFORCE_STEREO Then ENABLE_STEREO_PCM = _TRUE
+    N = MM_AUDIOCHOICE
+    If N < 1 Then N = MM_ADEF
+    If N > MM_ANUM Then N = MM_ANUM
+    aframe = MM_AFRAME(N)
+    Make_SectorAligned_AUDIO = MM_ARATE(N)
+End Function
+
+Function Make_AmigaAudio&
+    Dim N As Integer
+    ENABLE_16BIT_PCM = _FALSE
+    ENABLE_STEREO_PCM = _FALSE
+    MM_BuildAudioChoices 2, Val(MovieFPS$), _FALSE, _FALSE
+    N = MM_AUDIOCHOICE
+    If N < 1 Then N = MM_ADEF
+    If N > MM_ANUM Then N = MM_ANUM
+    aframe = MM_AFRAME(N)
+    AMIGA_PERIOD = MM_APERIOD(N)
+    AMIGA_RATE = MM_ARATE(N)
+    Make_AmigaAudio = _Round(MM_ARATE(N))
+End Function
+
+' the old "split into parts" questions, answered from the form
+Sub ASK_DO_PARTS
+    Dim PARTSIZE As _Unsigned _Integer64
+    Dim Msg$
+    DO_PART_VIDEO = MM_Chk(SplitCB)
+    If DO_PART_VIDEO Then
+        DO_PARTS_PREVIEW = MM_Chk(PartsPrevCB) And USE_VIDEO_PLAYER And USE_ASK_PLAYER
+        PARTSIZE = MM_PARTSIZE(MM_Sel(PartSizeDD))
+        NUMBER_OF_PARTS = 2
+        Do
+            If SPV_TOTAL_SIZE / NUMBER_OF_PARTS > PARTSIZE Then
+                NUMBER_OF_PARTS = NUMBER_OF_PARTS + 1
+            End If
+        Loop Until (SPV_TOTAL_SIZE / NUMBER_OF_PARTS) < PARTSIZE
+        FRAMES_PER_PART = Int(FrameCount / NUMBER_OF_PARTS)
+        TRAILING_FRAMES = FrameCount - (Int(FRAMES_PER_PART * NUMBER_OF_PARTS))
+    Else
+        DO_PARTS_PREVIEW = _FALSE
+        INFO_DIALOG "OVERSIZE VIDEO !", "This Video will function on the Desktop on NTFS, Linux & MAC File Systems." + CRLF + "But cannot work on a fat32 SD-Card !", "WARNING"
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Page switching
+' ---------------------------------------------------------------------------------
+Sub MM_ShowPage (mode As Integer)
+    Dim I As Long
+    MM_MODE = mode
+    For I = 1 To MM_NSETUP
+        MM_Vis MM_SetupIDs(I), (mode = 0)
+    Next
+    For I = 1 To MM_NCONV
+        MM_Vis MM_ConvIDs(I), (mode = 1)
+    Next
+    If mode = 0 Then MM_UpdateUI
+End Sub
+
+Sub MM_ConvText (S$)
+    SetCaption ConvInfoLB, S$
+End Sub
+
+Sub MM_ConvTitle (S$)
+    SetCaption ConvTitleLB, S$
+End Sub
+
+' progress for conversions without the preview
+Sub MM_Progress
+    If Abs(Timer - MM_LASTPROGRESS) < .06 Then Exit Sub
+    MM_LASTPROGRESS = Timer
+    Control(ConvPB).Value = Percentage
+    Control(ConvPB).Redraw = True
+    MM_Pump
+End Sub
+
+Sub MM_Relaunch
+    Dim CMD$
+    CMD$ = ""
+    If NO_LIMITS Then CMD$ = CMD$ + " -NOLIMITS"
+    If ENABLE_VGA Then CMD$ = CMD$ + " -VGA"
+    If ENABLE_AMIGA Then CMD$ = CMD$ + " -AMIGA"
+    If Len(MM_RELAUNCH_FILE$) > 0 Then CMD$ = CMD$ + " " + Chr$(34) + MM_RELAUNCH_FILE$ + Chr$(34)
+    ChDir MY_POP_DIR$
+    $If WINDOWS Then
+        Shell _DontWait "START " + GetFileName(MY_NAME$) + ".exe -NODEPS" + CMD$
+    $Else
+        Shell _DontWait MY_NAME$ + " -NODEPS" + CMD$ + " &"
+    $End If
+    System
+End Sub
+
+Sub MM_AbortRelaunch
+    MM_Relaunch
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Palette helper for 1 bit custom colors
+' ---------------------------------------------------------------------------------
+' picking a custom color switches the palette to "Custom colors"
+Sub MM_SelectCustomPal
+    Dim I As Integer
+    For I = 1 To MM_PalN
+        If MM_PalVal(I) = CUST_1BPP Then MM_SetSel PalDD, I
+    Next
+End Sub
+
+Sub MM_PickCustom1 (isFg As Integer)
+    Dim C As _Unsigned Long
+    If MM_C1SET = 0 Then MM_C1FG = _RGB32(255, 255, 255, 255): MM_C1BG = _RGB32(0, 0, 0, 255): MM_C1SET = _TRUE
+    If isFg Then
+        C = _ColorChooserDialog("1 BIT FOREGROUND", MM_C1FG)
+        If C <> 0 Then MM_C1FG = C: MM_SelectCustomPal
+    Else
+        C = _ColorChooserDialog("1 BIT BACKGROUND", MM_C1BG)
+        If C <> 0 Then MM_C1BG = C: MM_SelectCustomPal
+    End If
+End Sub
+
+Sub MM_Set1BitColors
+    Dim FG As _Unsigned Long, BG As _Unsigned Long
+    If MM_C1SET = 0 Then MM_C1FG = _RGB32(255, 255, 255, 255): MM_C1BG = _RGB32(0, 0, 0, 255): MM_C1SET = _TRUE
+    FG = MM_C1FG: BG = MM_C1BG
+    VERA_CUSTOM_FG.R = _ShR(_Red32(FG), 4)
+    VERA_CUSTOM_FG.GB = (_Green32(FG) And &HF0) Or _ShR(_Blue32(FG), 4)
+    VERA_CUSTOM_BG.R = _ShR(_Red32(BG), 4)
+    VERA_CUSTOM_BG.GB = (_Green32(BG) And &HF0) Or _ShR(_Blue32(BG), 4)
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Pieces shared by every type
+' ---------------------------------------------------------------------------------
+Sub MM_ApplyCommon
+    Dim dd As Integer, X$, tmp$
+    GO_SPRITE = _FALSE: GO_BITMAP = _FALSE: FOR_AMIGA = _FALSE: FOR_VGA = _FALSE
+    VGA_16C = _FALSE: VGA16_BARS = _FALSE
+    GO_DESKTOP_VIDEO = _FALSE: EXPERT_MODE = _FALSE: Bit_Map_Mode = _FALSE
+    MAKE_SECTOR_VIDEO = _FALSE: ENABLE_SPI_SPRITES = _FALSE: DO_JPG = _FALSE: DO_WEBP = _FALSE
+    FULL_24BIT_PALETTE = _FALSE: IS_DESKTOP_ONLY = _FALSE: OUT_OF_X16SPEC = _FALSE
+    WIDE_DISPLAY = _FALSE: K_TYPE = _FALSE: WANT_A_TALLVIDEO = _FALSE
+    Use_EMBEDDED_FramePalette = _TRUE: EXT_PALETTE_ON = _FALSE
+    NO_LIMITS = MM_Chk(NoLimitsCB)
+    ENABLE_VGA = MM_Chk(VgaCB)
+    ENABLE_AMIGA = MM_Chk(AmigaCB)
+
+    ' ---- audio
+    Interleave_Audio = MM_Chk(InterleaveCB)
+    ENABLE_16BIT_PCM = MM_Chk(Audio16CB)
+    ENABLE_STEREO_PCM = MM_Chk(AudioStereoCB)
+    AUDIO_EXTENTIONS_ON = ENABLE_16BIT_PCM Or ENABLE_STEREO_PCM
+    MM_AUDIORATE$ = _Trim$(Text(AudioRateTB))
+    MM_AUDIOCHOICE = MM_Sel(AudioSizeDD)
+
+    ' ---- crop
+    CROP_VIDEO = 0
+    CROP_VIDEO = MM_CROPSEL
+
+    ' ---- the conversion engine
+    CX16_IMG_MODE = (MM_BADWANT And CX16_IMG_AVAILABLE)
+    USE_YOLO = (CX16_IMG_MODE And MM_Chk(YoloCB))
+    DO_USE_FASTENCODING = MM_FASTUSE
+    USE_QB64FASTMODE = _FALSE
+    MAGICK_PARALLEL = Int(MM_Num(ThreadsTB))
+    SAVE_THREAD_CONFIG
+    ExtraMagick$ = ""
+    CMD_EXTRA$ = ""
+    If CX16_IMG_MODE Then
+        tmp$ = _Trim$(Text(BadmaiXTB))
+        If tmp$ <> "" Then CMD_EXTRA$ = Chr$(32) + tmp$ + Chr$(32)
+    ElseIf Not DO_USE_FASTENCODING Then
+        tmp$ = _Trim$(Text(MagickTB))
+        If tmp$ <> "" Then
+            If Left$(tmp$, 1) <> "-" Then tmp$ = "-" + tmp$
+            ExtraMagick$ = Chr$(32) + tmp$ + Chr$(32)
+        End If
+    End If
+    RUN_PRE_FILTER = MM_Chk(PreFilterCB)
+    If RUN_PRE_FILTER Then PRE_FILTER_COMMAND$ = _Trim$(Text(PreFilterTB)) + " "
+
+    ' ---- dither
+    USER_CHOSEN_DITHER = _FALSE
+    CUSTOM_DITHER = _FALSE
+    dd = MM_Sel(DitherDD)
+    If Control(DitherDD).Disabled = 0 And dd > 1 Then
+        USER_CHOSEN_DITHER = _TRUE
+        If dd = 11 Then
+            X$ = _Trim$(Text(DitherTB))
+            If X$ = "" Then X$ = "-dither none"
+            If Left$(X$, 1) <> "-" Then X$ = "-dither " + X$
+            DITH_STR = " " + X$ + " "
+            CUSTOM_DITHER = _TRUE
+        Else
+            If dd - 1 < 7 Then
+                DITH_STR = " -ordered-dither " + MM_DITHER$(dd - 1) + " "
+            Else
+                DITH_STR = " -dither " + MM_DITHER$(dd - 1) + " "
+            End If
+        End If
+    End If
+
+    ' ---- output options
+    Wipe_TMP_Files = MM_Chk(DeleteCB) And NEW_VIDEO_PROJECT
+    WantsPreview = MM_Chk(PreviewCB)
+    MM_PAUSE = MM_Chk(PauseCB)
+    FFMPEG_ERROR = _FALSE
+    MM_FFCOLOR = _FALSE
+End Sub
+
+Sub MM_AutoDither (bits As Integer)
+    If Not USER_CHOSEN_DITHER Then
+        If bits < 8 Then
+            DITH_STR = " -ordered-dither o2x2,15,15,15 "
+        Else
+            DITH_STR = " -dither Floydsteinberg "
+        End If
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  MM_Apply : the menus
+' ---------------------------------------------------------------------------------
+Sub MM_Apply
+    Dim T As Integer
+    T = M_TYPE
+    MM_ApplyCommon
+    Select Case T
+        Case MM_SPRITE: MM_ApplySprite
+        Case MM_BITMAP: MM_ApplyBitmap
+        Case MM_SECTOR: MM_ApplySector
+        Case MM_DESKTOP: MM_ApplyDesktop
+        Case MM_VGA: MM_ApplyVGA
+        Case MM_AMIGA: MM_ApplyAmiga
+    End Select
+    ' fast loading only for 8 bit videos (the old rule of MAIN_MENU)
+    If (GO_BITMAP And X_BITS = 8) Or (GO_SPRITE And (Not Make4BPP_VIDEO)) Then
+        If Not EXT_PALETTE_ON Then USE_QB64FASTMODE = DO_USE_FASTENCODING
+    End If
+End Sub
+
+Sub MM_ApplySprite
+    ' SPRITE_ResolutionMenu, F1
+    IN_STD_SPRITE = _TRUE
+    FormatChoice = M_SEL
+    EXPERT_MODE = (M_SEL = 9)
+    Use_EMBEDDED_FramePalette = _TRUE
+    Make4BPP_VIDEO = (M_BITS = 4)
+    GrayScaleVideo = M_GRAY
+    DoGreen = (M_BITS = 4 And M_PALVAL = GREEN_MODE)
+    DoAmber = (M_BITS = 4 And M_PALVAL = AMBER_MODE)
+    PALETTE_SHIFTING_ENABLED = M_PSHIFT
+    UsedCols$ = _Trim$(Str$(M_NCOLS))
+    ImageWidth = M_W
+    ImageHeight = M_H
+    X_BITS = M_BITS
+    VideoHeader.BPP = M_BITS
+    Bit_Map_Mode = _FALSE
+    GO_SPRITE = _TRUE
+    ENABLE_SPI_SPRITES = M_SPI
+    If M_EXT Then
+        EXT_PALETTE_ON = _TRUE
+        Use_EMBEDDED_FramePalette = _FALSE
+        EXT_PALETTE_METHOD = MM_Sel(ExtMethodDD)
+        SAVE_CUSTOM_BMP = MM_Chk(SaveMapCB)
+        MM_FFCOLOR = MM_Chk(FfColorCB) And (EXT_PALETTE_METHOD > 2)
+    End If
+    SetSpriteSizes
+    If Not USER_CHOSEN_DITHER Then
+        If Make4BPP_VIDEO Then
+            DITH_STR = " -ordered-dither o2x2,15,15,15 "
+        Else
+            DITH_STR = " -dither Floydsteinberg "
+        End If
+    End If
+End Sub
+
+Sub MM_ApplyBitmap
+    ' BITMAP_STDResolutionMenu, F1
+    Dim bits As Integer
+    IN_STD_BITMAP = _TRUE
+    Use_EMBEDDED_FramePalette = _TRUE
+    Make4BPP_VIDEO = _FALSE
+    UseDither = _TRUE
+    PALETTE_SHIFTING_ENABLED = _FALSE
+    EXT_PALETTE_ON = _FALSE
+    Bit_Map_Mode = _TRUE
+    BitMapChoice = M_SEL
+    ImageWidth = M_W
+    ImageHeight = M_H
+    X_BITS = M_BITS
+    GrayScaleVideo = M_GRAY
+    X_PALMODE = M_PALVAL
+    If M_PALVAL = CUST_1BPP Then MM_Set1BitColors
+    MM_AutoDither X_BITS
+    EXPERT_MODE = M_CUSTOM
+    If M_CUSTOM Then
+        ' GetFreeHandBits
+        If NO_LIMITS Then
+            DO_JPG = M_DOJPG
+            If M_PROMOTE Then
+                X_BITS = 8
+                If Not DO_JPG Then FULL_24BIT_PALETTE = M_PAL24
+            End If
+            If DO_JPG Then JPG_QUAL$ = M_JPGQ$: WEBP_QUAL$ = M_WEBPQ$: DO_WEBP = M_DOWEBP
+        End If
+        wid = ImageWidth
+        hei = ImageHeight
+        IS_DESKTOP_ONLY = ((ImageWidth * ImageHeight) / MM_BitDiv(X_BITS) > 38400) Or FULL_24BIT_PALETTE Or (X_BITS = 8)
+        If Not IS_DESKTOP_ONLY Then IS_DESKTOP_ONLY = ((ImageWidth <> 640) And (ImageWidth <> 320))
+        MM_AutoDither X_BITS
+    End If
+    ReturnChoice = 10
+    GO_BITMAP = _TRUE
+    SetBitMapMode
+    OUT_OF_X16SPEC = IS_DESKTOP_ONLY
+    If Not OUT_OF_X16SPEC Then
+        OUT_OF_X16SPEC = (sizex_bpp > 61440) Or (X_BITS = 8) Or ((ImageWidth <> 320) And (ImageWidth <> 640))
+    End If
+    bits = X_BITS
+End Sub
+
+Sub MM_ApplyDesktop
+    ' BITMAP_STDResolutionMenu with GO_DESKTOP_VIDEO (F9 of the main menu)
+    Use_EMBEDDED_FramePalette = _TRUE
+    Make4BPP_VIDEO = _FALSE
+    GrayScaleVideo = _FALSE
+    UseDither = _TRUE
+    PALETTE_SHIFTING_ENABLED = _FALSE
+    EXT_PALETTE_ON = _FALSE
+    Bit_Map_Mode = _TRUE
+    GO_DESKTOP_VIDEO = _TRUE
+    EXPERT_MODE = _TRUE
+    BitMapChoice = 6
+    ImageWidth = M_W
+    ImageHeight = M_H
+    DO_JPG = M_DOJPG
+    If DO_JPG Then JPG_QUAL$ = M_JPGQ$: WEBP_QUAL$ = M_WEBPQ$: DO_WEBP = M_DOWEBP Else FULL_24BIT_PALETTE = _TRUE
+    wid = ImageWidth
+    hei = ImageHeight
+    X_BITS = 8
+    IS_DESKTOP_ONLY = _TRUE
+    MM_AutoDither 8
+    ReturnChoice = 10
+    X_PALMODE = COLOR_MODE
+    SetBitMapMode
+    OUT_OF_X16SPEC = _TRUE
+    GO_BITMAP = _TRUE
+End Sub
+
+Sub MM_ApplySector
+    ' SECTOR_MENU, F1
+    Use_EMBEDDED_FramePalette = _TRUE
+    GrayScaleVideo = _FALSE
+    MAKE_SECTOR_VIDEO = _TRUE
+    SECTOR_CHOICE = M_SECTSEL
+    IN_SPI_BITMAP = _TRUE
+    EXPERT_MODE = M_CUSTOM
+    ImageWidth = M_W
+    ImageHeight = M_H
+    X_BITS = M_BITS
+    UsedCols$ = _Trim$(Str$(M_NCOLS))
+    PALETTE_SHIFTING_ENABLED = M_PSHIFT
+    X_PALMODE = COLOR_MODE
+    MM_AutoDither X_BITS
+    GO_BITMAP = _TRUE
+    SetBitMapMode
+    If X_BITS < 8 Then
+        GrayScaleVideo = M_GRAY
+        X_PALMODE = M_PALVAL
+        If M_PALVAL = CUST_1BPP Then MM_Set1BitColors
+    End If
+    OUT_OF_X16SPEC = _FALSE
+End Sub
+
+Sub MM_ApplyVGA
+    ' SECTOR_MENU, F2 / F9
+    WIDE_DISPLAY = _FALSE
+    K_TYPE = _FALSE
+    WANT_A_TALLVIDEO = _FALSE
+    FOR_VGA = _TRUE
+    VGA_13H = (M_SEL = 1)
+    VGA_MODEX = (M_SEL = 2 Or M_SEL = 3)
+    VGA_16C = (M_SEL = 4) ' VGA 16 color: VTYPE 88, BPP 4
+    VGA16_BARS = _FALSE
+    EXPERT_MODE = _FALSE
+    Use_EMBEDDED_FramePalette = _TRUE
+    EXT_PALETTE_ON = _FALSE
+    MAKE_SECTOR_VIDEO = _TRUE
+    IN_SPI_BITMAP = _TRUE
+    GrayScaleVideo = _FALSE
+    X_BITS = 8
+    If VGA_16C Then X_BITS = 4
+    SECTOR_CHOICE = 4
+    X_PALMODE = COLOR_MODE
+    UsedCols$ = "256"
+    If VGA_16C Then UsedCols$ = "16"
+    ImageWidth = 320
+    ImageHeight = M_H
+    MM_AutoDither 8
+    GO_BITMAP = _TRUE
+    SetBitMapMode
+    DoPadFrame = _FALSE
+End Sub
+
+Sub MM_ApplyAmiga
+    ' BITMAP_STDResolutionMenu F10 followed by SET_AmigaMode
+    Dim W As Long, H As Long, PlaneBytes As Long
+    IN_STD_BITMAP = _TRUE
+    Use_EMBEDDED_FramePalette = _TRUE
+    Make4BPP_VIDEO = _FALSE
+    UseDither = _TRUE
+    PALETTE_SHIFTING_ENABLED = _FALSE
+    EXT_PALETTE_ON = _FALSE
+    Bit_Map_Mode = _TRUE
+    FOR_AMIGA = _TRUE
+    BitMapChoice = 3
+    ImageWidth = 320
+    ImageHeight = 120
+    X_BITS = M_BITS
+    GrayScaleVideo = M_GRAY
+    X_PALMODE = M_PALVAL
+    ReturnChoice = 10
+    MM_AutoDither X_BITS
+    SetBitMapMode
+    GO_BITMAP = _FALSE
+    ' ---- SET_AmigaMode
+    W = M_W
+    H = M_H
+    ImageWidth = W
+    ImageHeight = H
+    Select Case X_BITS
+        Case 1: UsedCols$ = "2"
+        Case 2: UsedCols$ = "4"
+        Case Else: UsedCols$ = "16"
+    End Select
+    PlaneBytes = (ImageWidth \ 8) * ImageHeight
+    BytesPerFrame = (PlaneBytes * X_BITS) + (Val(UsedCols$) * 2)
+    VideoHeader.BPP = X_BITS
+    If AMIGA_PAL Then VideoHeader.HINT = "P" Else VideoHeader.HINT = "N"
+    DoAmber = _FALSE
+    Select Case M_PALVAL
+        Case COLOR_MODE
+            GrayScaleVideo = _FALSE
+            X_PALMODE = COLOR_MODE
+        Case GRAY_MODE, BW_MODE
+            GrayScaleVideo = _TRUE
+            X_PALMODE = GRAY_MODE
+        Case GREEN_MODE
+            GrayScaleVideo = _TRUE
+            X_PALMODE = GREEN_MODE
+        Case AMBER_MODE
+            GrayScaleVideo = _TRUE
+            X_PALMODE = AMBER_MODE
+            DoAmber = _TRUE
+        Case CUST_1BPP
+            GrayScaleVideo = _TRUE
+            X_PALMODE = CUST_1BPP
+            MM_Set1BitColors
+    End Select
+    If X_BITS = 1 And M_PALVAL = GRAY_MODE Then X_PALMODE = BW_MODE
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  SetUpMovieParameters, without the questions
+' ---------------------------------------------------------------------------------
+Sub MM_SetUp
+    Dim DOTPOS As Integer
+    Dim UserTall As Integer
+    UserTall = MM_Chk(TallCB) And (Control(TallCB).Disabled = 0)
+
+    If Not FOR_VGA Then
+        If GO_BITMAP And (Src_Aspect < 1) And ((ImageWidth = 320) Or IS_DESKTOP_ONLY) Then
+            WANT_A_TALLVIDEO = UserTall
+        End If
+        If GO_BITMAP And NO_LIMITS _AndAlso IS_DESKTOP_ONLY Then
+            If WANT_A_TALLVIDEO Then
+                VideoHeader.HINT = "T"
+                K_TYPE = _FALSE
+                GoTo STARTCONVERSION
+            End If
+        End If
+        If GO_BITMAP _AndAlso WANT_A_TALLVIDEO _AndAlso ImageWidth = 320 Then
+            VideoHeader.HINT = "K"
+            K_TYPE = _TRUE
+            GoTo STARTCONVERSION
+        End If
+    End If
+
+    If FOR_AMIGA Then GoTo STARTCONVERSION
+    If GO_BITMAP Then
+        VideoHeader.HINT = "N"
+        ' VGA portrait video is marked TALL (the black side bars are added by the converter)
+        If FOR_VGA And Src_Aspect > 0 And Src_Aspect < 1 Then VideoHeader.HINT = "T"
+        GoTo STARTCONVERSION
+    End If
+
+    If FormatChoice < 9 Then
+        VideoHeader.HINT = MovieChoice(FormatChoice).HINT
+        GoTo STARTCONVERSION
+    End If
+
+    ' expert sprite size
+    If X_BITS < 8 Then PALETTE_SHIFTING_ENABLED = _FALSE
+    Make4BPP_VIDEO = Val(UsedCols$) < 17
+    If Make4BPP_VIDEO Then VideoHeader.BPP = 4 Else VideoHeader.BPP = 8
+    If ENABLE_SPI_SPRITES Then MAKE_SECTOR_VIDEO = _TRUE
+    If Not Make4BPP_VIDEO And Not EXT_PALETTE_ON And Val(UsedCols$) < 250 Then
+        PALETTE_SHIFTING_ENABLED = M_PSHIFT
+    End If
+
+    STARTCONVERSION:
+    If KEEP_ASPECT And Not FOR_VGA And Not FOR_AMIGA Then
+        ' keep original aspect: only 16:9 sources get the "W" screen (HINT "A" is set with the header)
+        Dim effA As Double
+        effA = MM_EffAspect
+        If effA >= ASP_W_LO And effA <= ASP_W_HI Then
+            VideoHeader.HINT = "W"
+            WIDE_DISPLAY = _TRUE
+        End If
+        ' portrait on the X16 is always the K type: pad the picture to 9:16 (black bars, never stretched)
+        If K_TYPE And CROP_VIDEO = 0 And Src_Aspect > 0 And Src_Aspect < 1 Then
+            If Src_Aspect < ASP_K_LO Or Src_Aspect > ASP_K_HI Then CROP_VIDEO = 5
+        End If
+    ElseIf (Src_Aspect > 1.55) And (CROP_VIDEO = 0 Or CROP_VIDEO = 3) _AndAlso Not FOR_VGA _AndAlso Not FOR_AMIGA Then
+        VideoHeader.HINT = "W"
+        WIDE_DISPLAY = _TRUE
+    End If
+
+    UsedCols$ = _Trim$(UsedCols$)
+
+    If (WIDE_DISPLAY Or K_TYPE) And Val(UsedCols$) > 249 Then
+        If Val(UsedCols$) = 256 Then UsedCols$ = "255"
+        PALETTE_SHIFTING_ENABLED = _TRUE
+    End If
+
+    VideoHeader.FrameWidth = ImageWidth
+    VideoHeader.FrameHeight = ImageHeight
+    VideoHeader.SpriteWidth = SprWidth
+    VideoHeader.SpriteHeight = SprHeight
+    Palsize = 512
+    If Not Bit_Map_Mode And Not FOR_AMIGA Then
+        DIM_SPRITES
+    End If
+
+    MovieFPS$ = M_FPS$
+    DOTPOS = InStr(MovieFPS$, ".")
+    If DOTPOS + 2 < Len(MovieFPS$) Then MovieFPS$ = Left$(MovieFPS$, DOTPOS + 2)
+
+    TRUE_FPS = (_Round(Val(MovieFPS$) * 100)) / 100
+    VideoHeader.FPS = _Round(Val(MovieFPS$))
+
+    If CX16_IMG_MODE Then
+        SETUP_CX16_BUFFERS
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  End of a run
+' ---------------------------------------------------------------------------------
+' hh:mm:ss
+Function MM_Clock$ (Seconds As Double)
+    Dim H As Long, M As Long, S As Long
+    H = Int(Seconds / 3600)
+    M = Int((Seconds - H * 3600) / 60)
+    S = Int(Seconds - H * 3600 - M * 60)
+    MM_Clock = Right$("0" + _Trim$(Str$(H)), 2) + ":" + Right$("0" + _Trim$(Str$(M)), 2) + ":" + Right$("0" + _Trim$(Str$(S)), 2)
+End Function
+
+' the "DONE" block of the old program, drawn on the preview (or the text screen)
+Sub MM_DrawDone
+    Dim D As Long, R As Long, C As Long
+    D = _Dest
+    If MM_PREVIEW_ON And (MM_PREVIEW_IMG < -1) Then
+        _Dest MM_PREVIEW_IMG
+        _Font 16, MM_PREVIEW_IMG
+        Line (3, 457)-(696, 540), _RGB32(0, 0, 0), BF
+        R = 30: C = 2
+    Else
+        _Dest MM_SCR
+        R = 20: C = 2
+    End If
+    _PrintMode _FillBackground
+    Locate R, C
+    Tprint "{YEL}DONE !{WHT}  " + GetFileName(MovieName$) + GetFileExt(MovieName$) + "{GRAY 1}  (" + _Trim$(Str$(FrameCount)) + " frames)    "
+    Locate R + 1, C
+    Tprint "{WHT}Started{GRN}: {YEL}" + MM_STARTCLK$ + "   {WHT}Finished{GRN}: {YEL}" + MM_ENDCLK$ + "    "
+    Locate R + 2, C
+    Tprint "{WHT}Conversion Time{GRN}: {YEL}" + MM_Clock$(ConversionTime) + "   {WHT}Conversion Rate{GRN}: {YEL}" + MM_Fmt$("###.##", FrameCount / ConversionTime) + " {GRN}fps.    "
+    If D <> 0 Then _Dest D
+    MM_Blit
+End Sub
+
+Sub MM_Finish (ok As Integer, S$)
+    MM_BUSY = _FALSE
+    MM_DONE = _TRUE
+    MM_OK = ok
+    MM_ConvText S$
+    If ok Then
+        MM_ConvTitle "Conversion complete"
+        Control(ConvPB).Value = 100
+    Else
+        MM_ConvTitle "Conversion stopped"
+    End If
+    MM_En CancelBtn, _FALSE
+    MM_En SnapBtn, _FALSE
+    MM_En PlayBtn, (ok And USE_VIDEO_PLAYER And _FileExists(CURRENT_OUTSPV$))
+    MM_En OpenBtn, _TRUE
+    MM_En BackBtn, _TRUE
+    MM_Vis BackBtn, _TRUE
+    Control(ConvPB).Redraw = True
+End Sub
+
+Sub MM_Fail (S$)
+    _SndPlay ERROR_BEEP
+    MessageBox MM_Msg$(S$), "X16 Movie Maker", MsgBox_OkOnly + MsgBox_Critical
+    MM_Finish _FALSE, "Stopped:" + "\10;" + S$
+End Sub
+
+Sub MM_PlayLast
+    Dim PTARGET$, PCMD$
+    PTARGET$ = CURRENT_OUTSPV$
+    If _FileExists(TARGET_FOLDER$ + GetFileName(CURRENT_OUTSPV$) + GetFileExt(CURRENT_OUTSPV$)) Then PTARGET$ = TARGET_FOLDER$ + GetFileName(CURRENT_OUTSPV$) + GetFileExt(CURRENT_OUTSPV$)
+    If InStr(PTARGET$, Chr$(32)) > 0 Then PTARGET$ = Chr$(34) + PTARGET$ + Chr$(34)
+    PCMD$ = VIDEO_PLAYER_NAME$ + " -PLAY " + PTARGET$
+    $If LINUX Then
+        PCMD$ = PCMD$ + " &"
+    $End If
+    Shell _DontWait PCMD$
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  MM_Convert : the START_ME_UP flow
+' ---------------------------------------------------------------------------------
+Sub MM_Convert
+    Dim I As Long
+    Dim SubPath$, PDirName$, TPath2$, POPDIR$, TMP$, CMD$, TargetName$, AudioTrackName$
+    Dim NukeIT As Integer
+    Dim MoveDName$
+    Dim MovieSeconds As Double
+    Dim bdir$
+    Dim BPathName$
+    Dim ExAUDIO As Integer
+    Dim CURRENT_FRAME As Long, NEXT_FRAME As Long, LAST_FRAME As Long, FCount As Long
+    Dim EndT As Double
+
+    If MM_BUSY Then Exit Sub
+    MM_Calc
+    If M_ERR$ <> "" Then
+        MessageBox MM_Msg$(M_ERR$), "CHECK THE SETTINGS", MsgBox_OkOnly + MsgBox_Exclamation
+        Exit Sub
+    End If
+    If Not MM_HaveSource Then Exit Sub
+
+    ' ---- a Desktop video taller than the screen: warn (once a run), never forbid
+    If MM_Type = MM_DESKTOP And Not MM_HEIGHTWARNED Then
+        If M_H > _DesktopHeight Then
+            If Not GotYES("VIDEO HEIGHT", "The video height (" + _Trim$(Str$(M_H)) + ") is taller than your screen (" + _Trim$(Str$(_DesktopHeight)) + ")." + CRLF + CRLF + "The Desktop player will have to scale the picture down to fit." + CRLF + CRLF + "Continue ?   (You will not be asked again until the program is restarted.)", _FALSE) Then Exit Sub
+            MM_HEIGHTWARNED = _TRUE
+        End If
+    End If
+
+    If M_DOWEBP Then
+        If Not MM_HasLibwebp Then
+            MessageBox "Your ffmpeg has no libwebp encoder, so WebP frames can not be made." + CRLF + "Untick 'WebP (trial)' to make normal MJPG (JPEG) frames.", "WEBP NOT AVAILABLE", MsgBox_OkOnly + MsgBox_Exclamation
+            Exit Sub
+        End If
+    End If
+
+    ' ---- expert options: the text typed there goes to external programs unchecked
+    If Not MM_EXTRAWARNED Then
+        Dim usesExtra As Integer
+        usesExtra = _FALSE
+        If Control(MagickTB).Hidden = 0 And _Trim$(Text(MagickTB)) <> "" Then usesExtra = _TRUE
+        If Control(BadmaiXTB).Hidden = 0 And _Trim$(Text(BadmaiXTB)) <> "" Then usesExtra = _TRUE
+        If Control(PreFilterTB).Hidden = 0 And MM_Chk(PreFilterCB) Then usesExtra = _TRUE
+        If usesExtra Then
+            If Not GotYES("EXPERT OPTIONS IN USE", "You are using the extra encoder parameters and/or the external image pre-filter." + CRLF + CRLF + "The text typed there is passed to external programs and can not be checked by the Movie Maker." + CRLF + "A wrong command can give bad frames, make the conversion fail, or do something you did not intend." + CRLF + CRLF + "Continue ?   (You will not be asked again until the program is restarted.)", _FALSE) Then Exit Sub
+            MM_EXTRAWARNED = _TRUE
+        End If
+    End If
+
+    ' ---- the output name
+    MM_CONV_NAME$ = _Trim$(Text(OutTB))
+    If MM_CONV_NAME$ = "" Then MM_CONV_NAME$ = MM_AutoName
+    If GetFileExt(MM_CONV_NAME$) = "" Then MM_CONV_NAME$ = MM_CONV_NAME$ + ".SPV"
+    If InStr(MM_CONV_NAME$, "/") > 0 Or InStr(MM_CONV_NAME$, "\") > 0 Then
+        MessageBox "The movie name can not contain a folder.", "OUTPUT NAME", MsgBox_OkOnly + MsgBox_Exclamation
+        Exit Sub
+    End If
+    ' VGA (MS-DOS) videos need an 8.3 file name unless the user says otherwise
+    If MM_Type = MM_VGA And Not MM_IsDos83(MM_CONV_NAME$) And MM_CONV_NAME$ <> MM_DOS83OK$ Then
+        Dim sg$, r83 As Long
+        sg$ = MM_Dos83$(MM_CONV_NAME$)
+        r83 = MessageBox("The name  " + MM_CONV_NAME$ + "  will not work in MS-DOS (8 letters, 3 letter extension)." + CRLF + CRLF + "YES = use  " + sg$ + CRLF + "NO = keep my name (it will not work in MS-DOS)" + CRLF + "CANCEL = go back and change it", "MS-DOS FILE NAME", MsgBox_YesNoCancel + MsgBox_Exclamation)
+        Select Case r83
+            Case MsgBox_Yes
+                MM_CONV_NAME$ = sg$
+                MM_SetText OutTB, sg$
+            Case MsgBox_No
+                MM_DOS83OK$ = MM_CONV_NAME$
+            Case Else
+                Exit Sub
+        End Select
+    End If
+    ' would this overwrite something ?
+    TARGET_FOLDER$ = MM_TargetFolder$
+    Interleave_Audio = MM_Chk(InterleaveCB)
+    TMP$ = EXISTING_TARGETS$(MM_CONV_NAME$)
+    If TMP$ <> "" Then
+        If Not GotYES("MOVIE FILE EXISTS", TMP$ + CRLF + CRLF + "Already in the target folder !" + CRLF + "Overwrite ?   (No = choose another name)", _FALSE) Then Exit Sub
+    End If
+
+    ' ---- go
+    MM_BUSY = _TRUE: MM_DONE = _FALSE: MM_CANCEL = _FALSE: MM_SNAPREQ = _FALSE: MM_ABORT_REQ = _FALSE: MM_ABORTED = _FALSE
+    MM_ShowPage 1
+    MM_En CancelBtn, _TRUE: MM_En SnapBtn, _FALSE: MM_En PlayBtn, _FALSE: MM_En OpenBtn, _FALSE
+    MM_Vis BackBtn, _FALSE
+    Control(ConvPB).Value = 0
+    MM_ConvTitle "Preparing..."
+    MM_ConvText "Working..."
+    SetMyScreen 840, 600
+    MM_Show
+
+    MM_Apply
+    MM_SetUp
+    MM_AUDIOCHOICE = MM_Sel(AudioSizeDD)
+
+    For I = 0 To 255
+        ImagePalette(I) = VERA2RGB(VERAPALDEFAULT(I))
+    Next
+
+    ' ---- folders, frame extraction
+    If NEW_VIDEO_PROJECT Then
+        ChDir ProjectHome$
+        If FOR_AMIGA Then
+            SubPath$ = "AMIGA"
+        ElseIf FOR_VGA Then
+            SubPath$ = "VGA"
+        ElseIf OUT_OF_X16SPEC Then
+            SubPath$ = "DESK-VIDS"
+        ElseIf Bit_Map_Mode Then
+            SubPath$ = "BITMAP" + Slash$
+            Select Case VideoHeader.BPP
+                Case 1: SubPath$ = SubPath$ + "1BPP"
+                Case 2: SubPath$ = SubPath$ + "2BPP"
+                Case 4: SubPath$ = SubPath$ + "4BPP"
+                Case 8: SubPath$ = SubPath$ + "8BPP"
+            End Select
+        Else
+            SubPath$ = "SPRITEVIDS" + Slash$
+            If Make4BPP_VIDEO Then
+                TMP$ = "4BPP"
+            Else
+                TMP$ = "8BPP"
+            End If
+            If GrayScaleVideo Then TMP$ = "GRAYSCALE"
+            SubPath$ = SubPath$ + Slash$ + TMP$
+        End If
+
+        If MAKE_SECTOR_VIDEO And Not FOR_VGA Then SubPath$ = "SECTORALIGNED" + Slash$ + SubPath$
+        PDirName$ = GetFileName$(TName$)
+        If FOR_VGA And Not _DirExists("VGA") Then MkDir "VGA"
+        If FOR_AMIGA And Not _DirExists("AMIGA") Then MkDir "AMIGA"
+        If (Not FOR_AMIGA) And (Not FOR_VGA) And OUT_OF_X16SPEC Then
+            If Not _DirExists("DESK-VIDS") Then MkDir "DESK-VIDS"
+            If DO_JPG Then
+                ChDir "DESK-VIDS"
+                If Not _DirExists("MJPG") Then MkDir "MJPG"
+                SubPath$ = "DESK-VIDS" + Slash$ + "MJPG"
+                ChDir ".." + Slash$
+            End If
+        End If
+
+        TPath2$ = SubPath$ + Slash$ + PDirName$
+        If _DirExists(TPath2$) Then
+            POPDIR$ = _CWD$
+            ChDir SubPath$
+            NukeIT = GotYES("FOLDER EXISTS !", "DELETE Existing Folder? " + CRLF + CRLF + Left$(PDirName$, 30) + " ?", _FALSE)
+            If NukeIT Then Shell NukeDir$ + Chr$(32) + Chr$(34) + PDirName$ + Chr$(34)
+            MM_Delay .25
+            ChDir POPDIR$
+        End If
+        If _DirExists(TPath2$) Then
+            ChDir TPath2$
+        Else
+            MkDir TPath2$
+            ChDir TPath2$
+        End If
+        TPath$ = TPath2$
+
+        If _DirExists("frames") Then
+            NukeIT = GotYES("Existing Frames Folder", " DELETE ./frames ?", _TRUE)
+            If NukeIT Then
+                Shell NukeDir$ + "frames"
+                MM_Delay .25
+                MkDir "frames"
+            End If
+        Else
+            MkDir "frames"
+        End If
+
+        IN_CRITICAL_SECTION = -1
+        TARGET_FOLDER$ = _CWD$
+
+        MM_ConvTitle "Extracting frames"
+        FFMpeg_ExtractFrames 0
+        MM_FFSCR = _FALSE
+        If MM_ABORT_REQ Then MM_Fail "The audio settings are not usable.": Exit Sub
+        ChDir "frames"
+        USE_EXISTING_FRAMEFOLDER = _FALSE
+    Else
+        Wipe_TMP_Files = _FALSE
+        TARGET_FOLDER$ = NEW_TARGET_FOLDER$
+        ChDir FRAME_FOLDER$
+        TMP$ = ".." + Slash$ + "audio.out"
+        If _FileExists(TMP$) Then
+            SRC_AUDIOFILE$ = TMP$
+            GOT_EXISTING_AUDIO = _TRUE
+        End If
+    End If
+
+    CheckForFrames _CWD$
+    If FrameCount = 0 Then
+        MM_Fail "No frame files were found at: " + TPath$
+        Exit Sub
+    Else
+        VideoHeader.NumFrames = FrameCount
+    End If
+
+    If EXT_PALETTE_ON Then
+        EXT_OFFSET = 0
+        EXT_UPPER_COLOR = 255
+        EXTRA_CONVERT_MSG$ = "   Static Palette: "
+        EXTRA_CONVERT_MSG_T$ = " {WHT}Static Palette{GRN}: "
+        If Make4BPP_VIDEO Then EXT_UPPER_COLOR = 15
+        Select Case EXT_PALETTE_METHOD
+            Case 1
+                SETUP_EXTP_METHOD1
+                If Make4BPP_VIDEO Then
+                    EXT_OFFSET = 16
+                    GrayScaleVideo = _TRUE
+                    MakeDisplayGRAY
+                End If
+            Case 2
+                SETUP_EXTP_METHOD2
+                If Make4BPP_VIDEO Then
+                    EXT_OFFSET = 16
+                    GrayScaleVideo = _TRUE
+                    MakeDisplayGRAY
+                End If
+            Case 3
+                SETUP_EXTP_METHOD3
+            Case 4
+                SETUP_EXTP_METHOD4
+            Case 5
+                SETUP_EXTP_METHOD5
+            Case 6
+                SETUP_EXTP_METHOD6
+            Case 7
+                SWAPIN_IMMORTAL_PALETTE
+                SETUP_EXTP_METHOD1
+                EXTRA_CONVERT_MSG$ = "   Static Palette -> IMMORTAL PALETTE  "
+                EXTRA_CONVERT_MSG_T$ = "   {WHT}Static Palette {GRN}-{LIGHT GREEN}> {MAG}IMMORTAL {PURP}Palette{WHT}  "
+            Case 8
+                SWAPIN_IMMORTAL_PALETTE
+                SETUP_EXTP_METHOD2
+                EXTRA_CONVERT_MSG$ = "   Static Palette -> IMMORTAL PALETTE  "
+                EXTRA_CONVERT_MSG_T$ = "   {WHT}Static Palette {GRN}-{LIGHT GREEN}> {MAG}IMMORTAL {PURP}Palette{WHT}  "
+        End Select
+        SKIP_OVER_DISPLAYPAL_UPDATE = _TRUE
+    End If
+
+    ' ---- the movie name and the audio
+    MovieName$ = MM_CONV_NAME$
+    BASENAME$ = GetFileName(MovieName$)
+    If NEW_VIDEO_PROJECT Then
+        SRC_AUDIOFILE$ = ".." + Slash$ + "audio.out"
+    End If
+
+    MoveDName$ = MovieName$
+    AudioTrackName$ = GetFileName(MovieName$) + ".SVA"
+
+    If Not _FileExists(SRC_AUDIOFILE$) And Not MAKE_SILENT_VIDEO Then
+        MM_Fail SRC_AUDIOFILE$ + " Not Found (no audio.out)"
+        Exit Sub
+    End If
+
+    MovieName$ = TARGET_FOLDER$ + MovieName$
+
+    If Not Interleave_Audio Then
+        AudioTrackName$ = TARGET_FOLDER$ + AudioTrackName$
+        TargetName$ = AudioTrackName$
+        If InStr(TargetName$, Chr$(32)) > 0 Then TargetName$ = Chr$(34) + TargetName$ + Chr$(34)
+        CMD$ = SRC_AUDIOFILE$ + Chr$(32) + TargetName$
+        If MAKE_SILENT_VIDEO Then
+            MAKE_BLANK_AUDIOFILE AudioTrackName$, aframe * FrameCount
+        Else
+            If NEW_VIDEO_PROJECT And Wipe_TMP_Files Then
+                CMD$ = MoveCmd$ + CMD$
+            Else
+                CMD$ = CopyCmd$ + CMD$
+            End If
+            Shell CMD$
+        End If
+    End If
+
+    If MM_PAUSE Then
+        TMP$ = " Pause to allow adjustment of source files " + CRLF
+        TMP$ = TMP$ + " For example: replacement of audio.out." + CRLF + CRLF
+        TMP$ = TMP$ + "IN " + CRLF + Left$(TARGET_FOLDER$, 90) + CRLF + CRLF + "Press OK to continue."
+        INFO_DIALOG "PAUSE", TMP$, "info"
+    End If
+
+    If Interleave_Audio Then
+        OPEN_SourceAudio
+        If SUCCESS Then
+            VideoHeader.VTYPE = VideoHeader.VTYPE + 5
+            VideoHeader.VeraRATE = VERA_RATE
+            VideoHeader.AudFrmSize = Audio_FrameSize
+            TRUE_FPS = (_Round(Val(MovieFPS$) * 100)) / 100
+            VideoHeader.FPS = _Round(Val(MovieFPS$))
+        Else
+            MM_Fail "Error Opening Audio File !  (audio.out)"
+            Exit Sub
+        End If
+    End If
+
+    If TRUE_FPS <> Int(TRUE_FPS) Then
+        VideoHeader.XAUD_FLAG = "X"
+        VideoHeader.F_FPS = _Round(TRUE_FPS * 100)
+    End If
+
+    GET_TOTALSIZE
+
+    If EXT_PALETTE_ON Then
+        VideoHeader.VTYPE = VideoHeader.VTYPE + 1
+    End If
+
+    If MAKE_SECTOR_VIDEO Then
+        VideoHeader.VTYPE = VideoHeader.VTYPE + 20
+    End If
+
+    If FOR_VGA Then
+        If VGA_MODEX Then
+            VideoHeader.VTYPE = VGA_X_TYPE
+            QBUFFSIZE = (ImageHeight * ImageWidth) / 4
+            QBUFFSIZE = QBUFFSIZE - 1
+            ReDim QBUFF1(0 To QBUFFSIZE) As _Unsigned _Byte
+            ReDim QBUFF2(0 To QBUFFSIZE) As _Unsigned _Byte
+            ReDim QBUFF3(0 To QBUFFSIZE) As _Unsigned _Byte
+            ReDim QBUFF4(0 To QBUFFSIZE) As _Unsigned _Byte
+        Else
+            VideoHeader.VTYPE = VGA_VIDEO_TYPE
+        End If
+        If VGA_16C Then
+            ' VTYPE 88 with BPP 4: the frame is 4 bit planes, the same layout as the Amiga frame
+            VideoHeader.VTYPE = VGA_X_TYPE
+            VideoHeader.BPP = 4
+            QBUFFSIZE = (ImageHeight * ImageWidth) / 8
+            QBUFFSIZE = QBUFFSIZE - 1
+            ReDim QBUFF1(0 To QBUFFSIZE) As _Unsigned _Byte
+            ReDim QBUFF2(0 To QBUFFSIZE) As _Unsigned _Byte
+            ReDim QBUFF3(0 To QBUFFSIZE) As _Unsigned _Byte
+            ReDim QBUFF4(0 To QBUFFSIZE) As _Unsigned _Byte
+        End If
+    End If
+
+    VideoHeader.EXTRA = String$(6, 0)
+    If DO_JPG Then
+        VideoHeader.VTYPE = 99
+        ' Extra byte 1 says which picture format the frames are:  J = JPEG,  W = WebP  (human readable in a hex editor)
+        If DO_WEBP Then VideoHeader.EXTRA = "W" + String$(5, 0) Else VideoHeader.EXTRA = "J" + String$(5, 0)
+    End If
+
+    If FOR_VGA And VGA_MODEX Then
+        ' Mode X video: Extra byte 1 = ASCII "X", Extra byte 2 = 0 for the 320 x 200 screen, 1 for the 320 x 240 screen
+        VideoHeader.EXTRA = "X" + Chr$(-(M_SEL = 3)) + String$(4, 0)
+    End If
+
+    If FOR_AMIGA Then
+        Interleave_Audio = _TRUE
+        VideoHeader.VTYPE = AMIGA_VTYPE
+        VideoHeader.EXTRA = _MK$(_Unsigned Integer, AMIGA_PERIOD) + String$(4, 0)
+        QBUFFSIZE = (ImageHeight * ImageWidth) / 8
+        QBUFFSIZE = QBUFFSIZE - 1
+        ReDim AMIGAPAL(0 To _ShL(1, X_BITS) - 1) As AMI_PALTYPE
+        ReDim QBUFF1(0 To QBUFFSIZE) As _Unsigned _Byte
+        If X_BITS > 1 Then
+            ReDim QBUFF2(0 To QBUFFSIZE) As _Unsigned _Byte
+            If X_BITS > 2 Then
+                ReDim QBUFF3(0 To QBUFFSIZE) As _Unsigned _Byte
+                If X_BITS > 3 Then
+                    ReDim QBUFF4(0 To QBUFFSIZE) As _Unsigned _Byte
+                End If
+            End If
+        End If
+    End If
+
+    ' ---- X16 video types that go beyond what the X16 can play (Desktop player only):
+    '      Extra byte 1 = "X"   (the X16 player refuses to play anything with a non-zero byte there)
+    MM_DESKONLY = _FALSE
+    If Not (DO_JPG Or FOR_AMIGA Or FOR_VGA) Then
+        Dim dkSect As Integer, dkFrame As Double
+        dkSect = MAKE_SECTOR_VIDEO
+        dkFrame = (ImageWidth * ImageHeight) / MM_BitDiv(X_BITS)
+        If FULL_24BIT_PALETTE Then MM_DESKONLY = _TRUE
+        If GO_BITMAP Then
+            ' A: frame over 38400 bytes, or an 8 bit bitmap, without the sector aligned header
+            If Not dkSect And (dkFrame > 38400 Or X_BITS = 8) Then MM_DESKONLY = _TRUE
+            ' B: a bitmap width other than 640 or 320
+            If ImageWidth <> 640 And ImageWidth <> 320 Then MM_DESKONLY = _TRUE
+            ' D: a tall bitmap video that can not be a proper "K" type
+            If VideoHeader.HINT = "T" Then MM_DESKONLY = _TRUE
+        End If
+        ' C: more than 240,000 bytes a second without the sector aligned header
+        If Not dkSect And TOTAL_DATA_RATE > 240000 Then MM_DESKONLY = _TRUE
+        If MM_DESKONLY Then VideoHeader.EXTRA = "X" + String$(5, 0)
+    End If
+
+    ' ---- keep original aspect: HINT "A" + the aspect as a 5 byte CBM float in EXTRA bytes 2 - 6.
+    '      Desktop only videos (and MJPG) always get it; X16 videos only when the shape is outside the
+    '      4:3 / 16:9 ranges (portrait X16 videos are K types).  EXTRA byte 1 keeps its meaning.
+    If KEEP_ASPECT And Not (FOR_AMIGA Or FOR_VGA) Then
+        If MM_DESKONLY Or DO_JPG Or ASPECT_A Then
+            VideoHeader.HINT = "A"
+            VideoHeader.EXTRA = Left$(VideoHeader.EXTRA, 1) + MM_CBM5$(ASPECT_VAL)
+        End If
+    End If
+
+    ' ---- the numbers for the side panel
+    TMP$ = "###,###,###,###"
+    Dim S$
+    S$ = _Trim$(Str$(FrameCount)) + " frames" + "\10;"
+    S$ = S$ + "VType " + _Trim$(Str$(VideoHeader.VTYPE)) + "   " + _Trim$(Str$(VideoHeader.BPP)) + " bit" + "\10;"
+    S$ = S$ + _Trim$(Str$(ImageWidth)) + " x " + _Trim$(Str$(ImageHeight)) + "  " + _Trim$(Str$(TRUE_FPS)) + " fps" + "\10;" + "\10;"
+    S$ = S$ + "Movie size:" + "\10;" + MM_Fmt$(TMP$, SPV_TOTAL_SIZE) + " bytes" + "\10;"
+    If DO_PART_VIDEO Then S$ = S$ + "in " + _Trim$(Str$(NUMBER_OF_PARTS)) + " parts" + "\10;"
+    S$ = S$ + "\10;" + "Data rates (bytes/sec)" + "\10;"
+    S$ = S$ + "Video " + MM_Fmt$("###,###", VIDEO_DATA_RATE) + "\10;"
+    S$ = S$ + "Audio " + MM_Fmt$("###,###", AUDIO_DATA_RATE) + "\10;"
+    S$ = S$ + "Total " + MM_Fmt$("###,###", TOTAL_DATA_RATE) + "\10;"
+    If MM_DESKONLY Then S$ = S$ + "\10;" + "Desktop player only:" + "\10;" + "beyond what the X16 can play" + "\10;"
+    MM_ConvText S$
+    MM_SnapEnable WantsPreview
+
+    ' ---- the conversion  (the text screen must be tall enough for the status lines of the engine)
+    SetMyScreen 900, 700
+    MM_SHOW_RESET = _TRUE
+    MM_PREVIEW_ON = _FALSE
+    If USE_QB64FASTMODE Then
+        MM_ConvTitle "FAST convert - " + GetFileName(MovieName$)
+    Else
+        MM_ConvTitle "Converting - " + GetFileName(MovieName$)
+    End If
+    StartTime = Timer
+    MM_STARTCLK$ = Time$
+
+    If Not Wipe_TMP_Files Then
+        If Not _FileExists("frames.data") Then
+            Open "frames.data" For Output As 17
+            Print #17, "FPS="; _Trim$(MovieFPS$)
+            Print #17, "VBYTE="; _Trim$(Str$(VideoHeader.VeraRATE))
+            Print #17, "AFRAME="; _Trim$(Str$(Audio_FrameSize))
+            Close 17
+        End If
+    End If
+
+    If _FileExists(MovieName$) Then Kill MovieName$
+    If EXT_PALETTE_ON And (EXT_PALETTE_METHOD > 2) Then WRITE_VideoPaletteFile
+    MainLFN = 20
+
+    If FULL_24BIT_PALETTE Then
+        VideoHeader.PALTAG = Chr$(24)
+    End If
+
+    If DO_PART_VIDEO Then
+        ExAUDIO = _FALSE
+        BPathName$ = GetFilePath(MovieName$) + GetFileName(MovieName$)
+        NEXT_FRAME = 1
+        For CURRENT_PART = 1 To NUMBER_OF_PARTS
+            CURRENT_FRAME = NEXT_FRAME
+            If CURRENT_PART > 1 Then ExAUDIO = _TRUE
+            LAST_FRAME = CURRENT_FRAME + FRAMES_PER_PART - 1
+            FCount = FRAMES_PER_PART
+            If TRAILING_FRAMES > 0 Then
+                If LAST_FRAME < FrameCount Then
+                    LAST_FRAME = LAST_FRAME + 1
+                    FCount = FCount + 1
+                    TRAILING_FRAMES = TRAILING_FRAMES - 1
+                End If
+            End If
+            If CURRENT_PART < NUMBER_OF_PARTS Then
+                If LAST_FRAME / 2 <> Int(LAST_FRAME / 2) Then
+                    LAST_FRAME = LAST_FRAME + 1
+                    FCount = FCount + 1
+                End If
+            Else
+                If LAST_FRAME <> FrameCount Then LAST_FRAME = FrameCount
+            End If
+            NEXT_FRAME = LAST_FRAME + 1
+            CURRENT_OUTSPV$ = BPathName$ + PartName$(CURRENT_PART) + ".SPV"
+            If _FileExists(CURRENT_OUTSPV$) Then Kill CURRENT_OUTSPV$
+            Open CURRENT_OUTSPV$ For Binary As MainLFN
+            EXTRA_CONVERT_MSG$ = "      PART#: " + _Trim$(Str$(CURRENT_PART)) + " of " + _Trim$(Str$(NUMBER_OF_PARTS)) + " Parts..... "
+            EXTRA_CONVERT_MSG_T$ = "     {GRAY 1} PART{LIGHT GREEN}#{GRN}: {YEL}" + _Trim$(Str$(CURRENT_PART)) + "{GRAY 1} of {YEL}" + _Trim$(Str$(NUMBER_OF_PARTS)) + " {GRAY 1}Parts{LIGHT RED}.....{WHT} "
+            MM_ConvTitle "Converting - part " + _Trim$(Str$(CURRENT_PART)) + " of " + _Trim$(Str$(NUMBER_OF_PARTS))
+            Write_VIDEO_HEADER FCount, ExAUDIO
+            PROCESS_THE_FRAMES CURRENT_FRAME, LAST_FRAME
+            Close MainLFN
+            If DO_PARTS_PREVIEW And (CURRENT_PART < NUMBER_OF_PARTS) Then
+                If InStr(CURRENT_OUTSPV$, Chr$(32)) > 0 Then CURRENT_OUTSPV$ = Chr$(34) + CURRENT_OUTSPV$ + Chr$(34)
+                CMD$ = ASK_PLAYER_NAME$ + " " + CURRENT_OUTSPV$
+                $If LINUX Then
+                    CMD$ = CMD$ + " &"
+                $End If
+                $If WINDOWS Then
+                    Shell _DontWait _Hide CMD$
+                $Else
+                    Shell _DontWait CMD$
+                $End If
+            End If
+        Next
+        POST_PROCESS_PARTVIDEO
+    Else
+        CURRENT_OUTSPV$ = MovieName$
+        Open MovieName$ For Binary As MainLFN
+        Write_VIDEO_HEADER FrameCount, _FALSE
+        PROCESS_THE_FRAMES 1, FrameCount
+        Close MainLFN
+    End If
+
+    If Wipe_TMP_Files And EXT_PALETTE_ON Then KILL_TMP_MAPFILE
+
+    If Interleave_Audio Then
+        Close AudioLFN
+        If Wipe_TMP_Files _AndAlso _FileExists(SRC_AUDIOFILE$) Then Kill SRC_AUDIOFILE$
+    End If
+
+    Close 3
+    EndT = Timer
+    If StartTime > EndT Then StartTime = StartTime - 86400
+    ConversionTime = EndT - StartTime
+
+    WriteX16Player
+
+    If SAVE_CUSTOM_BMP Then
+        MAP_BMPFILE_NAME$ = GetFileName(MovieName$)
+        MAP_BMPFILE_NAME$ = MAP_BMPFILE_NAME$ + "-PalColorMap.bmp"
+        CREATE_PALETTE_BMP TARGET_FOLDER$ + MAP_BMPFILE_NAME$, _FALSE
+    End If
+
+    _SndPlay VID_FINISHED_SND
+
+    If NEW_VIDEO_PROJECT Then
+        ChDir ".." + Slash$
+        bdir$ = BARE_CWD
+        If Wipe_TMP_Files Then
+            If _FileExists("frames" + Slash$ + "IN.BMP") Then Kill "frames" + Slash$ + "IN.BMP"
+            If _FileExists("frames" + Slash$ + "outcolor.bmp") Then Kill "frames" + Slash$ + "outcolor.bmp"
+            If _FileExists("frames" + Slash$ + "COLMAPBMP.BMP") Then Kill "frames" + Slash$ + "COLMAPBMP.BMP"
+            $If WINDOWS Then
+                If _FileExists("nf.bat") Then Kill "nf.bat"
+                Open "nf.bat" For Output As 22
+                Print #22, "rmdir /s /q frames"
+                Close 22
+                MM_Delay .5
+                Shell _Hide "CMD /C nf.bat"
+                MM_Delay .25
+                Kill "nf.bat"
+            $Else
+                Shell _Hide NukeDir$ + "frames"
+            $End If
+            If _FileExists("out.mp4") Then Kill "out.mp4"
+            If _FileExists("outredcolor.mp4") Then Kill "outredcolor.mp4"
+        End If
+    End If
+    IN_CRITICAL_SECTION = _FALSE
+
+    If MM_ABORTED Then
+        MM_Finish _FALSE, "The conversion was cancelled."
+        Exit Sub
+    End If
+
+    TMP$ = "##.##"
+    S$ = "DONE !" + "\10;" + "\10;" + GetFileName(MovieName$) + GetFileExt(MovieName$) + "\10;"
+    S$ = S$ + _Trim$(Str$(FrameCount)) + " frames" + "\10;" + "\10;"
+    MM_ENDCLK$ = Time$
+    S$ = S$ + "Started   " + MM_STARTCLK$ + "\10;"
+    S$ = S$ + "Finished  " + MM_ENDCLK$ + "\10;" + "\10;"
+    S$ = S$ + "Conversion time" + "\10;"
+    S$ = S$ + MM_TimeStr$(ConversionTime) + "\10;" + "\10;"
+    S$ = S$ + "Conversion rate" + "\10;" + MM_Fmt$(TMP$, FrameCount / ConversionTime) + " fps"
+    MM_DrawDone
+    MM_Finish _TRUE, S$
+    If MM_PREVIEW_IMG < -1 Then MM_BlitImage MM_PREVIEW_IMG
+
+    If MM_Chk(TestPlayCB) And USE_VIDEO_PLAYER And ((Not DO_PART_VIDEO) _OrElse DO_PARTS_PREVIEW) Then
+        If GotYES("TEST PLAY", "Do you want a Test Play of " + CRLF + CRLF + GetFileName(CURRENT_OUTSPV$) + GetFileExt(CURRENT_OUTSPV$) + " ?", _TRUE) Then
+            MM_PlayLast
+        End If
+    End If
+End Sub
+
+Sub MM_SnapEnable (v As Integer)
+    MM_En SnapBtn, v
+End Sub
+
+Function MM_TimeStr$ (Seconds As Double)
+    Dim H As Long, M As Long, S As Long
+    H = Int(Seconds / 3600)
+    M = Int((Seconds - H * 3600) / 60)
+    S = Int(Seconds - H * 3600 - M * 60)
+    MM_TimeStr = _Trim$(Str$(H)) + "h " + _Trim$(Str$(M)) + "m " + _Trim$(Str$(S)) + "s"
+End Function
+
+Function MM_Fmt$ (F$, V As Double)
+    Dim R$, D As Long, I As Long, N$, S$
+    ' a simple "###,###" style formatter
+    N$ = _Trim$(Str$(Int(V + .5)))
+    If InStr(F$, ".") > 0 Then
+        D = Len(F$) - InStr(F$, ".")
+        S$ = Left$(Str$(Int(V * (10 ^ D) + .5) / (10 ^ D)), 20)
+        S$ = _Trim$(S$)
+        If InStr(S$, ".") = 0 Then S$ = S$ + "."
+        Do While Len(S$) - InStr(S$, ".") < D
+            S$ = S$ + "0"
+        Loop
+        MM_Fmt = S$
+        Exit Function
+    End If
+    If InStr(F$, ",") > 0 Then
+        R$ = ""
+        For I = Len(N$) To 1 Step -1
+            R$ = Mid$(N$, I, 1) + R$
+            If (Len(N$) - I + 1) Mod 3 = 0 And I > 1 Then R$ = "," + R$
+        Next
+        MM_Fmt = R$
+    Else
+        MM_Fmt = N$
+    End If
+End Function

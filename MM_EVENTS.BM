@@ -1,0 +1,228 @@
+' MM_EVENTS.BM -- InForm event handlers and the command line presets.
+
+' ---------------------------------------------------------------------------------
+'  Command line.  The old program NEEDED these to unlock things, now they are only
+'  optional presets (the same switches are check boxes on the form).
+' ---------------------------------------------------------------------------------
+Sub MM_ParseCommandLine
+    Dim I As Long
+    Dim C$
+    If _CommandCount = 0 Then Exit Sub
+    For I = 1 To _CommandCount
+        If _DirExists(Command$(I)) Then
+            If Not GOT_A_COMMAND_FOLDER Then GOT_A_COMMAND_FOLDER = _TRUE: CDIR_NUMBER = I
+        ElseIf _FileExists(Command$(I)) Then
+            If Not GOT_A_COMMAND_FILE Then GOT_A_COMMAND_FILE = _TRUE: CFILE_NUMBER = I
+        Else
+            C$ = UCase$(_Trim$(Command$(I)))
+            Select Case C$
+                Case "-NODEPS", "NODEPS": SKIP_DEP_CHECKS = _TRUE
+                Case "-NOLIMITS", "NOLIMITS": NO_LIMITS = _TRUE
+                Case "-AMIGA", "AMIGA": ENABLE_AMIGA = _TRUE
+                Case "-VGA", "VGA": ENABLE_VGA = _TRUE
+                Case "-ALL", "ALL": NO_LIMITS = _TRUE: ENABLE_AMIGA = _TRUE: ENABLE_VGA = _TRUE
+            End Select
+        End If
+    Next
+End Sub
+
+' a video file or a frame folder given on the command line (after the form exists)
+Sub MM_ApplyCommandSource
+    If GOT_A_COMMAND_FILE Then
+        GetSource_Parameters Command$(CFILE_NUMBER)
+        If Src_Width > 0 Then
+            VIDEO_IS_PICKED = _TRUE
+            NEW_VIDEO_PROJECT = _TRUE
+            USE_EXISTING_FRAMEFOLDER = _FALSE
+            If _FileExists(_CWD$ + Slash$ + Command$(CFILE_NUMBER)) Then
+                TName$ = _CWD$ + Slash$ + Command$(CFILE_NUMBER)
+            Else
+                TName$ = Command$(CFILE_NUMBER)
+            End If
+            DName$ = TName$
+            MM_SRCFILE$ = TName$
+            MM_CropList
+            If Src_Aspect > 1.9 Then MM_SetSel CropDD, 4 Else MM_SetSel CropDD, 1
+        End If
+    ElseIf GOT_A_COMMAND_FOLDER Then
+        Dim T$
+        T$ = Command$(CDIR_NUMBER)
+        CheckForFrames T$
+        If SUCCESS Then
+            TPath$ = T$
+            If Right$(TPath$, 1) <> Slash$ Then TPath$ = TPath$ + Slash$
+            FRAME_FOLDER$ = TPath$
+            ChDir TPath$
+            ChDir ".."
+            NEW_TARGET_FOLDER$ = _CWD$ + Slash$
+            VIDEO_IS_PICKED = _FALSE
+            NEW_VIDEO_PROJECT = _FALSE
+            USE_EXISTING_FRAMEFOLDER = _TRUE
+            MM_SRCFILE$ = ""
+            MM_SetText ProjTB, "New-X16-Video"
+            VIDEO_TITLE_FOR_EXISTING$ = "New-X16-Video"
+        End If
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  InForm events
+' ---------------------------------------------------------------------------------
+Sub __UI_BeforeInit
+End Sub
+
+Sub __UI_OnLoad
+    If AppIcon& < -1 Then _Icon AppIcon& ' again, now that the form window exists
+    MM_Startup
+    MM_ApplyCommandSource
+    MM_ShowPage 0
+    MM_UpdateUI
+End Sub
+
+Sub __UI_BeforeUpdateDisplay
+End Sub
+
+Sub __UI_BeforeUnload
+    If MM_BUSY Then
+        If MM_IN_FFMPEG Then
+            ' closing the window while ffmpeg is extracting = Cancel request
+            MM_CANCEL = _TRUE
+            __UI_UnloadSignal = False
+        ElseIf Not I_WantToQuit_CRITICAL Then
+            __UI_UnloadSignal = False
+        End If
+    End If
+End Sub
+
+Sub __UI_FormResized
+End Sub
+
+Sub __UI_Click (id As Long)
+    Select Case id
+        Case SrcBtn
+            MM_ChooseVideo
+            MM_UpdateUI
+        Case FramesBtn
+            GET_EXISTING_FRAMEFOLDER
+            MM_UpdateUI
+        Case TypeRB4
+            MM_DeskWarn
+        Case ConvertBtn
+            MM_Convert
+        Case QuitBtn
+            If I_WantToQuit Then System
+        Case AboutBtn
+            ABOUT
+        Case LicenseBtn
+            ShowLicense
+        Case C1FgBtn
+            MM_PickCustom1 _TRUE
+            MM_UpdateUI
+        Case C1BgBtn
+            MM_PickCustom1 _FALSE
+            MM_UpdateUI
+        Case CancelBtn
+            MM_CANCEL = _TRUE
+        Case SnapBtn
+            MM_SNAPREQ = _TRUE
+        Case PlayBtn
+            MM_PlayLast
+        Case OpenBtn
+            OPEN_TARGET_FOLDER
+        Case BackBtn
+            MM_Relaunch
+        Case FastCB, BadmaiCB, ImagickCB
+            MM_UpdateUI
+        Case Else
+            If MM_MODE = 0 And MM_STARTED Then MM_UpdateUI
+    End Select
+End Sub
+
+Sub __UI_ValueChanged (id As Long)
+    ' the check box value changes BEFORE Click arrives, so take the user's choice here
+    ' (otherwise UpdateUI would put the old preference back and the box looked dead)
+    If MM_MODE = 0 And MM_STARTED And (Not MM_UI_BUSY) Then
+        If id = BitRB1 Or id = BitRB2 Or id = BitRB3 Or id = BitRB4 Then
+            If Control(id).Value <> 0 And Control(id).Disabled = 0 Then
+                Dim nb As Integer, cdsel As Integer
+                If id = BitRB1 Then nb = 1
+                If id = BitRB2 Then nb = 2
+                If id = BitRB3 Then nb = 4
+                If id = BitRB4 Then nb = 8
+                If MM_Type = MM_SPRITE Then
+                    cdsel = MM_Sel(ColorDD)
+                    If nb = 4 And cdsel <> 5 And cdsel <> 6 Then MM_SetSel ColorDD, 5
+                    If nb = 8 And (cdsel = 5 Or cdsel = 6) Then MM_SetSel ColorDD, 1
+                ElseIf MM_Type = MM_VGA Then
+                    ' 4 bit = VGA 16 color.  8 bit = back to the last 256 color mode chosen
+                    If nb = 4 Then MM_SetSel VgaDD, 4
+                    If nb = 8 And MM_Sel(VgaDD) = 4 Then
+                        If MM_VGALAST < 1 Or MM_VGALAST > 3 Then MM_VGALAST = 1
+                        MM_SetSel VgaDD, MM_VGALAST
+                    End If
+                Else
+                    MM_BITSEL = nb
+                    MM_LinkBits
+                End If
+            End If
+        End If
+        If id = ResDD Then MM_LinkSize
+        If id = VgaDD Then
+            ' remember the last 256 color mode, the 8 bit button returns to it
+            If MM_Sel(VgaDD) < 4 Then MM_VGALAST = MM_Sel(VgaDD)
+        End If
+        If id = DeleteCB And Control(DeleteCB).Disabled = 0 Then MM_DELOFF = (MM_Chk(DeleteCB) = 0)
+        ' engine boxes: BADMAI replaces ImageMagick (and turns Fast off); Fast goes together with ImageMagick.
+        ' Only a value different from what UpdateUI put there is the user's own click.
+        If id = FastCB Then
+            If MM_Chk(FastCB) <> MM_FASTLAST Then
+                MM_FASTWANT = MM_Chk(FastCB)
+                If MM_FASTWANT Then MM_BADWANT = _FALSE
+            End If
+        ElseIf id = BadmaiCB Then
+            If MM_Chk(BadmaiCB) <> MM_BADLAST Then
+                MM_BADWANT = MM_Chk(BadmaiCB)
+                If MM_BADWANT Then MM_FASTWANT = _FALSE
+            End If
+        ElseIf id = ImagickCB Then
+            If MM_Chk(ImagickCB) <> MM_IMGLAST Then MM_BADWANT = _FALSE
+        End If
+    End If
+    If MM_MODE = 0 And MM_STARTED And (Not MM_UI_BUSY) Then MM_UpdateUI
+End Sub
+
+Sub __UI_TextChanged (id As Long)
+    If MM_MODE = 0 And MM_STARTED And (Not MM_UI_BUSY) Then MM_UpdateUI
+End Sub
+
+Sub __UI_KeyPress (id As Long)
+    If MM_BUSY Then
+        If __UI_KeyHit = _KEY_F12 Then MM_SNAPREQ = _TRUE
+    End If
+End Sub
+
+Sub __UI_MouseEnter (id As Long)
+End Sub
+
+Sub __UI_MouseLeave (id As Long)
+End Sub
+
+Sub __UI_FocusIn (id As Long)
+End Sub
+
+Sub __UI_FocusOut (id As Long)
+    ' when a size box is left, show the value that was really used (rounded / clamped)
+    If MM_MODE = 0 And MM_STARTED And (id = WTB Or id = HTB) Then
+        MM_UpdateUI
+        If M_ERR$ = "" Then
+            If id = WTB And Control(WTB).Disabled = 0 Then MM_SetText WTB, _Trim$(Str$(M_W))
+            If id = HTB And Control(HTB).Disabled = 0 Then MM_SetText HTB, _Trim$(Str$(M_H))
+        End If
+    End If
+End Sub
+
+Sub __UI_MouseDown (id As Long)
+End Sub
+
+Sub __UI_MouseUp (id As Long)
+End Sub

@@ -1,0 +1,620 @@
+' MM_FRONT.BM -- the InForm front end of X16 Movie Maker.
+' One main form replaces every menu, dialog and prompt of the old text mode program.
+' Included AFTER InForm.bi, the form (.frm), MM_SHIM.BM and the engine.
+
+Dim Shared MM_TypeRB(1 To 6) As Long
+Dim Shared SPR_W(1 To 8) As Long, SPR_H(1 To 8) As Long
+Dim Shared BMP_W(1 To 5) As Long, BMP_H(1 To 5) As Long
+Dim Shared MM_DEPS_OK As Integer
+Dim Shared MM_PAUSE As Integer
+Dim Shared MM_LASTAUTO$
+Dim Shared MM_PSLAST As Integer
+Dim Shared MM_TALLLAST As Integer
+Dim Shared MM_FPSLAST$
+Dim Shared MM_AUDLAST$
+Dim Shared MM_AMIGA_BYTES As Long
+Dim Shared MM_NOTE$
+Dim Shared MM_PARTSIZE(1 To 6) As _Unsigned _Integer64
+Dim Shared MM_DITHER$(1 To 9)
+Dim Shared MM_ExtraStart As Integer
+
+' ---------------------------------------------------------------------------------
+'  Small helpers around InForm controls
+' ---------------------------------------------------------------------------------
+Function MM_Chk% (id As Long)
+    MM_Chk = (Control(id).Value <> 0)
+End Function
+
+Sub MM_SetChk (id As Long, v As Integer)
+    Dim nv As Integer
+    If v Then nv = -1 Else nv = 0
+    If Control(id).Value <> nv Then
+        Control(id).Value = nv
+        Control(id).Redraw = True
+    End If
+End Sub
+
+Sub MM_En (id As Long, v As Integer)
+    Dim d As Integer
+    If v Then d = 0 Else d = -1
+    If Control(id).Disabled <> d Then
+        Control(id).Disabled = d
+        Control(id).Redraw = True
+    End If
+End Sub
+
+Sub MM_Vis (id As Long, v As Integer)
+    Dim h As Integer
+    If v Then h = 0 Else h = -1
+    If Control(id).Hidden <> h Then
+        Control(id).Hidden = h
+        Control(id).Redraw = True
+    End If
+End Sub
+
+' show and enable (or hide) in one go
+Sub MM_Show2 (id As Long, vis As Integer, ena As Integer)
+    MM_Vis id, vis
+    If vis Then MM_En id, ena
+End Sub
+
+Sub MM_SetText (id As Long, T$)
+    If Text(id) <> T$ Then
+        Text(id) = T$
+        Control(id).Redraw = True
+    End If
+End Sub
+
+Sub MM_SetCap (id As Long, T$)
+    If Caption(id) <> T$ Then SetCaption id, T$
+End Sub
+
+Function MM_Sel% (id As Long)
+    Dim v As Integer
+    v = Control(id).Value
+    If v < 1 Then v = 1
+    MM_Sel = v
+End Function
+
+Sub MM_SetSel (id As Long, n As Integer)
+    If n < 1 Then n = 1
+    If Control(id).Value <> n Then
+        Control(id).Value = n
+        Control(id).Redraw = True
+    End If
+End Sub
+
+' True while the "X16 High bandwidth sprite" radio is the chosen output type.
+' It is the sprite type with sector aligned (SPI) frames: M_SPI / ENABLE_SPI_SPRITES -> MAKE_SECTOR_VIDEO -> VTYPE + 20
+Function MM_HB%
+    MM_HB = (Control(TypeRBHS).Value <> 0)
+End Function
+
+Function MM_Type%
+    Dim I As Integer
+    If Control(TypeRBHS).Value <> 0 Then MM_Type = MM_SPRITE: Exit Function
+    MM_Type = MM_BITMAP
+    For I = 1 To 6
+        If Control(MM_TypeRB(I)).Value <> 0 Then MM_Type = I: Exit Function
+    Next
+End Function
+
+Sub MM_SetType (T As Integer)
+    Dim I As Integer
+    For I = 1 To 6
+        If I = T Then Control(MM_TypeRB(I)).Value = -1 Else Control(MM_TypeRB(I)).Value = 0
+        Control(MM_TypeRB(I)).Redraw = True
+    Next
+    Control(TypeRBHS).Value = 0
+    Control(TypeRBHS).Redraw = True
+End Sub
+
+' numeric text box, -1 when empty / not a number
+Function MM_Num# (id As Long)
+    Dim S$
+    S$ = _Trim$(Text(id))
+    If S$ = "" Then MM_Num = -1: Exit Function
+    If Not IsNum(S$) Then MM_Num = -1: Exit Function
+    MM_Num = Val(S$)
+End Function
+
+Sub MM_Status (S$)
+    MM_STATUSTXT$ = S$
+    If StatusLB <> 0 Then MM_SetCap StatusLB, S$
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Start up.  Everything the old program did before its first menu, minus dialogs.
+' ---------------------------------------------------------------------------------
+' The "Crop ultra wide to 16:9" choice is only listed for an ultra wide source (ratio > 1.79)
+Sub MM_CropList
+    Dim uw As Integer
+    uw = (Src_Aspect > 1.79 And VIDEO_IS_PICKED)
+    If uw = (MM_CROPUW <> 0) Then Exit Sub
+    If uw Then
+        MM_FillDropdown CropDD, "None  (wide source is marked WIDE)|Crop to 4:3|Letterbox to 4:3  (*Usually unnecessary*)|Crop ultra wide to 16:9"
+    Else
+        MM_FillDropdown CropDD, "None  (wide source is marked WIDE)|Crop to 4:3|Letterbox to 4:3  (*Usually unnecessary*)"
+    End If
+    Control(CropDD).Value = 1
+    If uw Then MM_CROPUW = _TRUE Else MM_CROPUW = _FALSE
+End Sub
+
+Sub MM_FillDropdown (id As Long, items$)
+    ' items$ is a "|" separated list
+    Dim P As Long, S$, T$
+    ResetList id
+    S$ = items$
+    Do
+        P = InStr(S$, "|")
+        If P = 0 Then
+            If S$ <> "" Then AddItem id, S$
+            Exit Do
+        End If
+        T$ = Left$(S$, P - 1)
+        AddItem id, T$
+        S$ = Mid$(S$, P + 1)
+    Loop
+    Control(id).Value = 1
+End Sub
+
+Sub MM_LoadThreads
+    Dim F As Long
+    Dim L$
+    Dim N As Long
+    Dim GotIt As Integer
+    Dim CFile$
+    CFile$ = ProjectHome$ + Slash$ + THREAD_CFG_NAME$
+    If _FileExists(CFile$) Then
+        F = FreeFile
+        Open CFile$ For Input As F
+        If Not EOF(F) Then Line Input #F, L$
+        Close F
+        L$ = _Trim$(L$)
+        If InStr(L$, "=") > 0 Then L$ = _Trim$(Mid$(L$, InStr(L$, "=") + 1))
+        If IsNum(L$) Then
+            N = Val(L$)
+            If N >= 1 And N <= MAX_PIPE_THREADS And N = Int(N) Then
+                MAGICK_PARALLEL = N
+                GotIt = _TRUE
+            End If
+        End If
+    End If
+    If Not GotIt Then
+        MAGICK_PARALLEL = THREAD_DEFAULT
+        SAVE_THREAD_CONFIG
+    End If
+End Sub
+
+Sub MM_CheckDeps
+    Dim DepCMD$, Missing$, Found As Integer
+    Dim I As Long
+    If SKIP_DEP_CHECKS Then MM_DEPS_OK = _TRUE: Exit Sub
+    Restore DEPENDENCIES
+    Do
+        Read DepCMD$
+        If DepCMD$ = "DONE" Then Exit Do
+        Found = IsInstalled(DepCMD$)
+        $If WINDOWS Then
+        $Else
+            ' Linux/Mac: ImageMagick 7 may only provide "magick" (no "convert")
+            If (Not Found) And DepCMD$ = "convert" Then
+                Found = IsInstalled("magick")
+                If Not Found Then DepCMD$ = "convert (or magick)"
+            End If
+        $End If
+        If Not Found Then Missing$ = Missing$ + "   " + DepCMD$ + "\n"
+    Loop
+    If Missing$ = "" Then
+        MM_DEPS_OK = _TRUE
+    Else
+        MM_DEPS_OK = _FALSE
+        MessageBox "These programs were not found on your PATH:\n\n" + Missing$ + "\nInstall them and start Movie Maker again.\n(ffmpeg, ffprobe and ImageMagick are required to convert.)", "MISSING DEPENDENCIES", MsgBox_OkOnly + MsgBox_Critical
+    End If
+End Sub
+
+Sub MM_Startup
+    Dim I As Long
+    MM_FillGroups
+    MM_TypeRB(1) = TypeRB1: MM_TypeRB(2) = TypeRB2: MM_TypeRB(3) = TypeRB3
+    MM_TypeRB(4) = TypeRB4: MM_TypeRB(5) = TypeRB5: MM_TypeRB(6) = TypeRB6
+
+    LOAD_VERA_DEFAULTPALETTES
+    Restore RES_CHOICES
+    For I = 1 To 8
+        Read MovieChoice(I).XRes
+        Read MovieChoice(I).YRes
+    Next
+    Restore Choice_Hints
+    For I = 1 To 8
+        Read MovieChoice(I).HINT
+    Next
+    For I = 1 To 8
+        SPR_W(I) = MovieChoice(I).XRes
+        SPR_H(I) = MovieChoice(I).YRes
+    Next
+    BMP_W(1) = 320: BMP_H(1) = 240
+    BMP_W(2) = 640: BMP_H(2) = 480
+    BMP_W(3) = 320: BMP_H(3) = 120
+    BMP_W(4) = 640: BMP_H(4) = 120
+    BMP_W(5) = 640: BMP_H(5) = 140
+
+    MM_PARTSIZE(1) = 500000000: MM_PARTSIZE(2) = 1000000000: MM_PARTSIZE(3) = 1500000000
+    MM_PARTSIZE(4) = 2000000000: MM_PARTSIZE(5) = 2500000000: MM_PARTSIZE(6) = 3000000000
+    MM_DITHER$(1) = "o2x2,15,15,15": MM_DITHER$(2) = "o4x4,15,15,15": MM_DITHER$(3) = "o8x8,15,15,15"
+    MM_DITHER$(4) = "h4x4a": MM_DITHER$(5) = "h4x4o": MM_DITHER$(6) = "h8x8o"
+    MM_DITHER$(7) = "Riemersma": MM_DITHER$(8) = "Floydsteinberg": MM_DITHER$(9) = "none"
+
+    ProjectHome$ = HomeDir$ + Slash$ + "x16vidprojects"
+    If Not _DirExists(ProjectHome$) Then MkDir ProjectHome$
+    CheckProjectSubDirs
+
+
+    MM_LoadThreads
+
+    VideoHeader.ID = "SPRV"
+    VideoHeader.VTYPE = 1
+    VideoHeader.F_FPS = 0
+    VideoHeader.XAUD_BYTE = 0
+    VideoHeader.XAUD_FLAG = Chr$(0)
+    Use16BitAudio = _FALSE
+
+    For I = 0 To 255
+        ImagePalette(I) = VERA2RGB(VERAPALDEFAULT(I))
+    Next
+
+    MM_ParseCommandLine
+    MM_CheckDeps
+
+    ' ---- fill the lists
+    MM_FillDropdown ColorDD, "256 colors|240 colors  (palette shifting)|224 colors  (palette shifting)|Custom number of colors|16 colors  (4 bit)"
+    MM_FillDropdown VgaDD, "Mode 13h  320x200|Mode X  320x200|Mode X  320x240|VGA 16 color  320x200"
+    MM_FillDropdown AmiStdDD, "NTSC|PAL"
+    MM_FillDropdown PartSizeDD, "0.5 GB|1 GB|1.5 GB|2 GB|2.5 GB|3 GB"
+    Control(PartSizeDD).Value = 4
+    MM_FillDropdown CropDD, "None  (wide source is marked WIDE)|Crop to 4:3|Letterbox to 4:3  (*Usually unnecessary*)|Crop ultra wide to 16:9"
+    MM_FillDropdown ExtMethodDD, "1  VERA default palette (map during conversion)|2  VERA default palette (map after conversion)|3  External palette (map during conversion)|4  External palette (map after conversion)|5  Palette from source frames (map during)|6  Palette from source frames (map after)|7  IMMORTAL palette (map during conversion)|8  IMMORTAL palette (map after conversion)"
+    MM_FillDropdown DitherDD, "Automatic|o2x2  ordered|o4x4  ordered|o8x8  ordered|h4x4a  halftone|h4x4o  halftone|h8x8o  halftone|Riemersma|Floyd-Steinberg|None|Custom (type below)"
+    MM_FillDropdown ResDD, "-"
+    MM_FillDropdown PalDD, "Color"
+    MM_FillDropdown AudioSizeDD, "-"
+
+    ' ---- defaults taken from the engine
+    $If DESK_EDITION = TRUE Then
+        ' desktop edition: the desktop-only extensions are always on, VGA and Amiga never
+        NO_LIMITS = _TRUE: ENABLE_VGA = _FALSE: ENABLE_AMIGA = _FALSE
+        SetCaption SplitCB, "Split into parts if too big for FAT32"
+    $Else
+        SetCaption SplitCB, "Split into parts if the movie is too big for FAT32"
+    $End If
+    MM_SetChk NoLimitsCB, NO_LIMITS
+    MM_SetChk VgaCB, ENABLE_VGA
+    MM_SetChk AmigaCB, ENABLE_AMIGA
+    MM_SetChk DeleteCB, _TRUE
+    MM_SetChk PreviewCB, _TRUE
+    MM_SetChk TestPlayCB, _TRUE
+    MM_SetChk SplitCB, _TRUE
+    MM_SetChk AspectCB, _TRUE
+    MM_SetChk InterleaveCB, Interleave_Audio
+    MM_SetChk FastCB, DO_USE_FASTENCODING
+    MM_SetText ThreadsTB, _Trim$(Str$(MAGICK_PARALLEL))
+    MM_SetText JpgQTB, "4"
+    MM_SetText WebpQTB, "85"
+    MM_SetText ColorsTB, "240"
+    MM_SetText AudioRateTB, "16044"
+    $If DESK_EDITION = TRUE Then
+        MM_SetType MM_DESKTOP
+    $Else
+        MM_SetType MM_SECTOR
+    $End If
+    MM_LASTTYPE = 0
+    MM_STARTED = _TRUE
+    MM_RefillForType
+    MM_Status "Choose a video (or existing frames) to begin."
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Lists that depend on the output type / bit depth
+' ---------------------------------------------------------------------------------
+Sub MM_RefillForType
+    Dim T As Integer
+    T = MM_Type
+    Select Case T
+        Case MM_SPRITE
+            MM_FillDropdown ResDD, "1   160 x 112|2   192 x 128|3   96 x 160|4   80 x 144|5   320 x 112|6   320 x 88|7   224 x 112|8   224 x 96|9   Custom size (expert)"
+            Control(ResDD).Value = 1
+        Case MM_BITMAP
+            MM_FillDropdown ResDD, "1   320 x 240|2   640 x 480|3   320 x 120|4   640 x 120|5   640 x 140|6   Custom size (expert)"
+            $If DESK_EDITION = TRUE Then
+                Control(ResDD).Value = 6 ' desktop edition: palettized video always uses the custom size
+            $Else
+                Control(ResDD).Value = 3
+            $End If
+        Case MM_SECTOR
+            MM_FillDropdown ResDD, "1   320 x 240|2   640 x 240|3   640 x 480|4   320 x 136|5   640 x 192"
+            Control(ResDD).Value = 4
+    End Select
+    MM_RefillBits
+End Sub
+
+Sub MM_RefillBits
+    Dim T As Integer
+    T = MM_Type
+    Select Case T
+        Case MM_BITMAP, MM_AMIGA
+            If MM_LASTTYPE <> T Or (MM_BITSEL <> 1 And MM_BITSEL <> 2 And MM_BITSEL <> 4) Then MM_BITSEL = 4
+        Case MM_SECTOR
+            MM_BITSEL = 8
+        Case Else
+            MM_BITSEL = 8
+    End Select
+    MM_RefillPal
+End Sub
+
+' ---- bit depth <-> resolution rules (High Bandwidth and standard bitmap)
+' High bandwidth sizes: 1 320x240  2 640x240  3 640x480  4 320x136  5 640x192
+' Bitmap sizes:         1 320x240  2 640x480  3 320x120  4 640x120  5 640x140  6 custom
+Function MM_BitOK% (T As Integer, sz As Integer, b As Integer)
+    MM_BitOK = (b = 1 Or b = 2 Or b = 4)
+    Select Case T
+        Case MM_SECTOR
+            Select Case sz
+                Case 1: MM_BitOK = (b = 1 Or b = 2 Or b = 4)
+                Case 2: MM_BitOK = (b = 2)
+                Case 3: MM_BitOK = (b = 1)
+                Case 4: MM_BitOK = (b = 8)
+                Case 5: MM_BitOK = (b = 4)
+            End Select
+        Case MM_BITMAP
+            Select Case sz
+                Case 2: MM_BitOK = (b = 1)
+                Case 5: MM_BitOK = (b = 1 Or b = 2)
+            End Select
+    End Select
+End Function
+
+' the user picked a bit depth: move the size if the current one can not do it (keeps the width when possible)
+Sub MM_LinkBits
+    Dim T As Integer, sz As Integer, b As Integer, n As Integer
+    T = MM_Type: sz = MM_Sel(ResDD): b = MM_BITSEL: n = sz
+    If T <> MM_SECTOR And T <> MM_BITMAP Then Exit Sub
+    If MM_BitOK(T, sz, b) Then Exit Sub
+    If T = MM_SECTOR Then
+        Select Case b
+            Case 8: n = 4
+            Case 4: If sz = 2 Or sz = 3 Then n = 5 Else n = 1
+            Case 2: If sz = 5 Or sz = 3 Then n = 2 Else n = 1
+            Case 1: If sz = 2 Or sz = 5 Then n = 3 Else n = 1
+        End Select
+    Else
+        If sz = 2 Then n = 4
+        If sz = 5 And b = 4 Then n = 4
+    End If
+    If n <> sz Then MM_SetSel ResDD, n
+End Sub
+
+' the user picked a size: change the bit depth if the size can not do the current one
+Sub MM_LinkSize
+    Dim T As Integer, sz As Integer, b As Integer, nb As Integer
+    T = MM_Type: sz = MM_Sel(ResDD): b = MM_BITSEL: nb = b
+    If T <> MM_SECTOR And T <> MM_BITMAP Then Exit Sub
+    If MM_BitOK(T, sz, b) Then Exit Sub
+    If T = MM_SECTOR Then
+        Select Case sz
+            Case 1: nb = 4
+            Case 2: nb = 2
+            Case 3: nb = 1
+            Case 4: nb = 8
+            Case 5: nb = 4
+        End Select
+    Else
+        If sz = 2 Then nb = 1
+        If sz = 5 Then nb = 2
+    End If
+    MM_BITSEL = nb
+End Sub
+
+' the size index the converter code knows (High Bandwidth: size + bit depth -> 1..7)
+Function MM_ResSel%
+    Dim sz As Integer
+    sz = MM_Sel(ResDD)
+    If MM_Type = MM_SECTOR Then
+        Select Case sz
+            Case 1
+                Select Case MM_BITSEL
+                    Case 4: MM_ResSel = 1
+                    Case 2: MM_ResSel = 5
+                    Case Else: MM_ResSel = 6
+                End Select
+            Case 2: MM_ResSel = 2
+            Case 3: MM_ResSel = 3
+            Case 4: MM_ResSel = 4
+            Case Else: MM_ResSel = 7
+        End Select
+    Else
+        MM_ResSel = sz
+    End If
+End Function
+
+' bits per pixel chosen on the form for the bit-depth driven types (0 = not applicable)
+Function MM_FormBits%
+    Dim T As Integer
+    T = MM_Type
+    Select Case T
+        Case MM_BITMAP, MM_AMIGA
+            Select Case MM_BITSEL
+                Case 1: MM_FormBits = 1
+                Case 2: MM_FormBits = 2
+                Case Else: MM_FormBits = 4
+            End Select
+        Case MM_SECTOR
+            MM_FormBits = MM_BITSEL
+        Case MM_DESKTOP
+            MM_FormBits = 8
+        Case MM_VGA
+            ' the 16 color choice (4th in the drop down) is a 4 bit video
+            If MM_Sel(VgaDD) = 4 Then MM_FormBits = 4 Else MM_FormBits = 8
+        Case MM_SPRITE
+            If MM_Sel(ColorDD) = 5 Then MM_FormBits = 4 Else MM_FormBits = 8
+        Case Else
+            MM_FormBits = 0
+    End Select
+End Function
+
+Dim Shared MM_PAL1KEEP As Integer, MM_PAL1SET As Integer
+Sub MM_RefillPal
+    Dim T As Integer, B As Integer, oldv As Integer, keep As Integer, I As Integer
+    T = MM_Type
+    B = MM_FormBits
+    ' remember the old palette mode so a refill keeps the choice
+    keep = -1
+    If MM_PalN > 0 Then
+        I = MM_Sel(PalDD)
+        If I >= 1 And I <= MM_PalN Then keep = MM_PalVal(I)
+    End If
+    ' leaving the 1 bit list: remember its palette choice so it is back when 1 bit is chosen again
+    If MM_PalN = 6 And keep >= 0 Then MM_PAL1KEEP = keep: MM_PAL1SET = _TRUE
+    If B = 1 And MM_PAL1SET Then keep = MM_PAL1KEEP
+    If B = 1 Then
+        MM_FillDropdown PalDD, "Color|Black and white|Gray|Green phosphor|Amber phosphor|Custom colors"
+        MM_PalN = 6
+        MM_PalVal(1) = COLOR_MODE: MM_PalVal(2) = BW_MODE: MM_PalVal(3) = GRAY_MODE
+        MM_PalVal(4) = GREEN_MODE: MM_PalVal(5) = AMBER_MODE: MM_PalVal(6) = CUST_1BPP
+    Else
+        MM_FillDropdown PalDD, "Color|Gray|Green phosphor|Amber phosphor"
+        MM_PalN = 4
+        MM_PalVal(1) = COLOR_MODE: MM_PalVal(2) = GRAY_MODE
+        MM_PalVal(3) = GREEN_MODE: MM_PalVal(4) = AMBER_MODE
+    End If
+    For I = 1 To MM_PalN
+        If MM_PalVal(I) = keep Then Control(PalDD).Value = I
+    Next
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Source selection
+' ---------------------------------------------------------------------------------
+Sub MM_ChooseVideo
+    Dim OldT$, OldD$
+    OldT$ = TName$: OldD$ = DName$
+    CHOOSE_A_VIDEOFILE
+    If VIDEO_IS_PICKED And TName$ <> "" And TName$ <> OldT$ Then
+        MM_SRCFILE$ = TName$
+        USE_EXISTING_FRAMEFOLDER = _FALSE
+        NEW_VIDEO_PROJECT = _TRUE
+        MM_CropList
+        If Src_Aspect > 1.9 Then MM_SetSel CropDD, 4 Else MM_SetSel CropDD, 1
+        MM_LASTAUTO$ = "": MM_SetText OutTB, ""
+    End If
+End Sub
+
+Sub GET_EXISTING_FRAMEFOLDER
+    Dim T$
+    Dim POPDIR$
+    POPDIR$ = _CWD$
+    $If WINDOWS Then
+        ChDir ProjectHome$
+        T$ = _SelectFolderDialog$("Select Source FRAME Folder", ".\")
+        ChDir POPDIR$
+    $Else
+        T$ = _SelectFolderDialog$("Select Source FRAME Folder", ProjectHome$)
+    $End If
+    If T$ = "" Then Exit Sub
+    CheckForFrames T$
+    If Not SUCCESS Then
+        INFO_DIALOG "NO FRAMES", "No frame files were found in:" + CRLF + T$, "error"
+        Exit Sub
+    End If
+    TPath$ = T$
+    If Right$(TPath$, 1) <> Slash$ Then TPath$ = TPath$ + Slash$
+    FRAME_FOLDER$ = TPath$
+    Dim TF$
+    $If WINDOWS Then
+        ChDir FRAME_FOLDER$
+        ChDir ".."
+        NEW_TARGET_FOLDER$ = _CWD$
+        ChDir POPDIR$
+    $Else
+        TF$ = _SelectFolderDialog$("Select Project Target Folder", ".." + Slash$)
+        If TF$ = "" Then
+            INFO_DIALOG "TARGET FOLDER", "A target folder is needed to save the movie.", "info"
+            Exit Sub
+        End If
+        If Right$(TF$, 1) <> Slash$ Then TF$ = TF$ + Slash$
+        NEW_TARGET_FOLDER$ = TF$
+    $End If
+    VIDEO_IS_PICKED = _FALSE
+    NEW_VIDEO_PROJECT = _FALSE
+    USE_EXISTING_FRAMEFOLDER = _TRUE
+    MM_SRCFILE$ = ""
+    If _Trim$(Text(ProjTB)) = "" Then MM_SetText ProjTB, "New-X16-Video"
+    VIDEO_TITLE_FOR_EXISTING$ = _Trim$(Text(ProjTB))
+    MM_LASTAUTO$ = "": MM_SetText OutTB, ""
+End Sub
+
+Function MM_HaveSource%
+    MM_HaveSource = (VIDEO_IS_PICKED And TName$ <> "") Or USE_EXISTING_FRAMEFOLDER
+End Function
+
+' the movie name that is used when the Name box is left alone
+Function MM_AutoName$
+    Dim N$
+    If USE_EXISTING_FRAMEFOLDER Then
+        N$ = _Trim$(Text(ProjTB))
+        If N$ = "" Then N$ = "New-X16-Video"
+        N$ = N$ + ".SPV"
+    Else
+        N$ = GetFileName(DName$) + ".SPV"
+    End If
+    If MM_Type <> MM_DESKTOP Then N$ = COMMODORE_FRIENDLY_NAME(N$)
+    If MM_Type = MM_VGA Then N$ = MM_Dos83$(N$)
+    MM_AutoName = N$
+End Function
+
+' ---- MS-DOS 8.3 file names (VGA types 86 and 88)
+' valid: 1 to 8 characters, a dot, 0 to 3 characters; A-Z 0-9 and ! # $ % & ' ( ) - @ ^ _ ` { } ~
+Function MM_Dos83Char% (c$)
+    Dim a As Integer
+    a = Asc(c$)
+    MM_Dos83Char = (a >= 65 And a <= 90) Or (a >= 48 And a <= 57) Or (InStr("!#$%&'()-@^_`{}~", c$) > 0)
+End Function
+
+Function MM_IsDos83% (fn$)
+    Dim b$, x$, d As Long, i As Long
+    MM_IsDos83 = _FALSE
+    Dim u$
+    u$ = UCase$(fn$)
+    d = _InStrRev(u$, ".")
+    If d = 0 Then b$ = u$: x$ = "" Else b$ = Left$(u$, d - 1): x$ = Mid$(u$, d + 1)
+    If Len(b$) < 1 Or Len(b$) > 8 Or Len(x$) > 3 Then Exit Function
+    For i = 1 To Len(b$)
+        If Not MM_Dos83Char(Mid$(b$, i, 1)) Then Exit Function
+    Next
+    For i = 1 To Len(x$)
+        If Not MM_Dos83Char(Mid$(x$, i, 1)) Then Exit Function
+    Next
+    MM_IsDos83 = _TRUE
+End Function
+
+' a valid 8.3 version of a name: upper case, bad characters dropped (spaces become _), 8 + 3
+Function MM_Dos83$ (fn$)
+    Dim b$, x$, o$, c$, d As Long, i As Long
+    d = _InStrRev(fn$, ".")
+    If d = 0 Then b$ = fn$: x$ = ".SPV" Else b$ = Left$(fn$, d - 1): x$ = Mid$(fn$, d)
+    b$ = UCase$(b$): x$ = UCase$(Mid$(x$, 2))
+    o$ = ""
+    For i = 1 To Len(b$)
+        c$ = Mid$(b$, i, 1)
+        If c$ = " " Then c$ = "_"
+        If MM_Dos83Char(c$) Then o$ = o$ + c$
+    Next
+    If o$ = "" Then o$ = "VIDEO"
+    b$ = Left$(o$, 8)
+    o$ = ""
+    For i = 1 To Len(x$)
+        c$ = Mid$(x$, i, 1)
+        If MM_Dos83Char(c$) Then o$ = o$ + c$
+    Next
+    If o$ = "" Then o$ = "SPV"
+    MM_Dos83 = b$ + "." + Left$(o$, 3)
+End Function

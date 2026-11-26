@@ -1,0 +1,18 @@
+# Built programs (build them from the .bas files; releases carry them)
+MakeX16Movie
+MovieMakerDesk
+MMFASTFRAME
+ASKPLAY
+WRITE_AMPLAYER
+PLAYMOVIES-VID
+*.license.txt
+# Windows builds of the above (cximg2bin.exe is tracked: third-party, binary only)
+MakeX16Movie.exe
+MovieMakerDesk.exe
+MMFASTFRAME.exe
+ASKPLAY.exe
+WRITE_AMPLAYER.exe
+PLAYMOVIES-VID.exe
+# working notes and unused files
+ASSETS-LICENSES.md
+FILM.ICO

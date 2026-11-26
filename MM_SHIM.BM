@@ -1,0 +1,359 @@
+' MM_SHIM.BM -- InForm replacements for the dialog / screen helpers of the old program.
+' Included AFTER InForm.bi and the form.
+
+' ---------------------------------------------------------------------------------
+'  Dialogs.  The old program drew its own dialog boxes, now InForm's MessageBox does it.
+' ---------------------------------------------------------------------------------
+Function MM_Msg$ (S$)
+    Dim T$, P As Long
+    T$ = S$
+    Do
+        P = InStr(T$, CRLF)
+        If P = 0 Then Exit Do
+        T$ = Left$(T$, P - 1) + "\n" + Mid$(T$, P + 2)
+    Loop
+    MM_Msg = T$
+End Function
+
+' does the installed ffmpeg have the libwebp encoder ?
+Function MM_HasLibwebp%
+    Dim T$, F$, D$, R$, fn As Integer
+    D$ = Environ$("TEMP")
+    If D$ = "" Then D$ = Environ$("TMPDIR")
+    If D$ = "" Then D$ = "/tmp"
+    If Right$(D$, 1) <> "/" And Right$(D$, 1) <> "\" Then D$ = D$ + Slash$
+    F$ = D$ + "mm_encoders.txt"
+    If _FileExists(F$) Then Kill F$
+    Shell _Hide "ffmpeg -hide_banner -encoders > " + Chr$(34) + F$ + Chr$(34) + " 2>&1"
+    MM_HasLibwebp = _FALSE
+    If _FileExists(F$) Then
+        R$ = _ReadFile$(F$)
+        Kill F$
+        If InStr(R$, "libwebp") > 0 Then MM_HasLibwebp = _TRUE
+    End If
+End Function
+
+Function GotYES (Title$, Mesg$, DEFVAL%)
+    Dim flags As Long, R As Long
+    flags = MsgBox_YesNo + MsgBox_Question
+    If Not DEFVAL% Then flags = flags + MsgBox_DefaultButton2
+    R = MessageBox(MM_Msg$(Mesg$), _Trim$(Title$), flags)
+    GotYES = (R = MsgBox_Yes)
+End Function
+
+Sub INFO_DIALOG (Title$, Mesg$, btype$)
+    Dim flags As Long
+    Select Case LCase$(_Trim$(btype$))
+        Case "error": flags = MsgBox_Critical
+        Case "warning": flags = MsgBox_Exclamation
+        Case Else: flags = MsgBox_Information
+    End Select
+    MessageBox MM_Msg$(Mesg$), _Trim$(Title$), MsgBox_OkOnly + flags
+End Sub
+
+' Free text prompts are now fields on the main form, this only remains as a safety net
+Function INPUT_DIALOG$ (Title$, Mesg$, DEFVAL$, MaxLength As Integer, DIGITS_ONLY As Integer)
+    INPUT_DIALOG = DEFVAL$
+End Function
+
+Function I_WantToQuit
+    I_WantToQuit = GotYES("QUIT ?", "Do you really want to quit ?", _FALSE)
+End Function
+
+Function I_WantToQuit_CRITICAL
+    I_WantToQuit_CRITICAL = GotYES("QUIT ?", "A conversion is in progress !" + CRLF + CRLF + "Do you really want to quit ?", _FALSE)
+End Function
+
+
+' The old program quit here (after a cancelled or failed run).  Now it returns to the setup form.
+Sub EXIT_MOVIEMAKER
+    MM_ABORTED = _TRUE
+    MM_Relaunch
+End Sub
+
+Sub MM_Nop
+End Sub
+
+' "the screen" of the old program: the conversion preview while it is shown, else the text screen
+Sub MM_DestScr
+    If MM_PREVIEW_ON And (MM_PREVIEW_IMG < -1) Then
+        _Dest MM_PREVIEW_IMG
+    Else
+        _Dest MM_SCR
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------------
+'  Old mouse / keyboard helpers.  InForm owns the input now.
+' ---------------------------------------------------------------------------------
+Sub MouseTick_ON
+End Sub
+
+Sub MouseTick_OFF
+End Sub
+
+Sub flushkeys
+End Sub
+
+Sub KEYFLUSH
+End Sub
+
+Sub ClickSound
+End Sub
+
+Function Click%
+    Click = 0
+End Function
+
+' ---------------------------------------------------------------------------------
+'  Screens.  SetMyScreen used to switch the whole program window, it now just
+'  (re)creates the engine canvas that is displayed inside the form.
+' ---------------------------------------------------------------------------------
+Sub MM_Title (T$)
+    MM_STATUSTXT$ = T$
+End Sub
+
+Sub MM_Delay (Seconds As Single)
+    Dim T As Double
+    T = Timer
+    Do
+        MM_Pump
+        _Limit 60
+        If Timer < T Then T = T - 86400
+    Loop While Timer - T < Seconds
+End Sub
+
+' Let InForm process events and redraw.  The engine's drawing destination is protected.
+Sub MM_Pump
+    Dim D As Long
+    D = _Dest
+    _Dest 0
+    __UI_DoEvents
+    If MM_BUSY Then
+        If __UI_KeyHit = _KEY_F12 Then MM_SNAPREQ = _TRUE
+    End If
+    If D <> 0 Then _Dest D
+End Sub
+
+Sub MM_Show
+    MM_Blit
+    MM_Pump
+End Sub
+
+' The text screens keep the old layout (cells of the 20 pt font: 840x600 = 70 x 30 cells), but the
+' font is reloaded NATIVELY at the largest point size whose screen fits the preview box 1:1, and the
+' screen is sized to match (cols * cell width, rows * cell height), so it is never shrunk when shown.
+' width of one character cell of a monospaced font (_FontWidth is not reliable here)
+Function MM_CellW& (f As Long)
+    Dim t As Long
+    t = _NewImage(400, 100, 32)
+    _Font f, t
+    MM_CellW = _PrintWidth("MMMMMMMMMM", t) \ 10
+    _FreeImage t
+End Function
+
+Sub SetMyScreen (W%, H%)
+    Dim Old As Long
+    Dim cols As Long, rows As Long, pt As Long, cw As Long, ch As Long
+    Dim availW As Long, availH As Long, bs As Long
+    Dim f As Long
+    Static fonts(8 To 20) As Long
+    Static baseW As Long, baseH As Long
+    If baseW = 0 Then
+        fonts(20) = Myfont&
+        baseW = MM_CellW(Myfont&): baseH = _FontHeight(Myfont&)
+        If baseW < 1 Then baseW = 12
+        If baseH < 1 Then baseH = 20
+    End If
+    availW = 750: availH = 626
+    If PreviewPB <> 0 Then
+        bs = Control(PreviewPB).BorderSize * Abs(Control(PreviewPB).HasBorder)
+        availW = Control(PreviewPB).Width - bs * 2 - 16
+        availH = Control(PreviewPB).Height - bs * 2 - 16
+    End If
+    cols = W% \ baseW: rows = H% \ baseH
+    For pt = 20 To 8 Step -1
+        If fonts(pt) = 0 Then fonts(pt) = _LoadFont(_Embedded$("myfont"), pt, "MEMORY|MONO")
+        f = fonts(pt)
+        If f > 0 Then
+            cw = MM_CellW(f): ch = _FontHeight(f)
+            If cols * cw <= availW And rows * ch <= availH Then Exit For
+        End If
+    Next
+    If pt < 8 Then pt = 8: f = fonts(8): cw = MM_CellW(f): ch = _FontHeight(f)
+    Myfont& = f
+    MM_SCALE = ch / baseH
+    Old = MM_SCR
+    MM_SCR = _NewImage(cols * cw, rows * ch, 32)
+    MY_DISPLAY = MM_SCR
+    MM_PREVIEW_ON = _FALSE
+    _Dest MM_SCR
+    Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+    _PrintMode _FillBackground
+    Cls
+    _Font Myfont&
+    If Old < -1 Then _FreeImage Old
+End Sub
+
+Sub FreeMyScreen
+End Sub
+
+Sub GenericScreen (Title$)
+    Dim i As Long
+    SetMyScreen 640, 360
+    MM_Title Title$
+    ShowLogo
+    For i = 1 To 8: Print: Next
+    MM_Show
+End Sub
+
+Sub PROG_HEADER (ScreenTitle$)
+    Dim I As Integer
+    _Dest MM_SCR
+    Color _RGB(255, 255, 255), _RGB(0, 0, 180)
+    Cls
+    MM_Title ScreenTitle$
+    For I = 1 To 7: Print: Next
+    ShowLogo
+    MM_Show
+End Sub
+
+' header picture of the FFmpeg screens: "Running FFmpeg." instead of the X16 logo
+Sub MM_FFHeader
+    If FFHdr& < -1 And MM_SCR < -1 Then _PutImage (0, 0)-(_Round(_Width(FFHdr&) * MM_SCALE) - 1, _Round(_Height(FFHdr&) * MM_SCALE) - 1), FFHdr&, MM_SCR, , _Smooth
+End Sub
+
+' every header is the "Running FFmpeg." picture now (the X16 logo header is gone)
+Sub ShowLogo
+    MM_FFHeader
+End Sub
+
+' Draw an image into the preview PictureBox, scaled to fit and centered.
+Sub MM_BlitImage (Img As Long)
+    Dim bs As Long, W As Long, H As Long, SD As Long
+    Dim iw As Long, ih As Long, dw As Long, dh As Long, dx As Long, dy As Long
+    Dim S As Double
+    If PreviewPB = 0 Then Exit Sub
+    If Img >= -1 Then Exit Sub
+    SD = _Dest
+    bs = Control(PreviewPB).BorderSize * Abs(Control(PreviewPB).HasBorder)
+    W = Control(PreviewPB).Width - bs * 2
+    H = Control(PreviewPB).Height - bs * 2
+    If W < 1 Or H < 1 Then Exit Sub
+    If Control(PreviewPB).HelperCanvas >= -1 Then
+        Control(PreviewPB).HelperCanvas = _NewImage(W, H, 32)
+    ElseIf _Width(Control(PreviewPB).HelperCanvas) <> W Or _Height(Control(PreviewPB).HelperCanvas) <> H Then
+        _FreeImage Control(PreviewPB).HelperCanvas
+        Control(PreviewPB).HelperCanvas = _NewImage(W, H, 32)
+    End If
+    Const BEV = 8
+    Dim GAP As Long
+    GAP = 12
+    ' the text screens are drawn 1:1 (no shrinking, so the small font stays crisp)
+    If Img = MM_SCR Then GAP = 0
+    Static BG As Long
+    Static bgW As Long, bgH As Long, bgX As Long, bgY As Long, bgDW As Long, bgDH As Long, bgB As Long
+    Dim yB As Long
+    iw = _Width(Img)
+    ih = _Height(Img)
+    S = (W - (BEV + GAP) * 2) / iw
+    If (H - (BEV + GAP) * 2) / ih < S Then S = (H - (BEV + GAP) * 2) / ih
+    If S > 1 Then S = 1
+    dw = _Round(iw * S)
+    dh = _Round(ih * S)
+    dx = (W - dw) \ 2
+    dy = (H - dh) \ 2
+    ' the conversion preview has a black text area at the bottom (rows 453+ of 580)
+    yB = 100000
+    If MM_PREVIEW_ON And Img = MM_PREVIEW_IMG Then yB = dy + _Round(453 / ih * dh)
+    If BG >= -1 Or bgB <> yB Or bgW <> W Or bgH <> H Or bgX <> dx Or bgY <> dy Or bgDW <> dw Or bgDH <> dh Then
+        If BG < -1 Then _FreeImage BG
+        BG = MM_BuildFrameBG(W, H, dx, dy, dw, dh, BEV, yB)
+        bgW = W: bgH = H: bgX = dx: bgY = dy: bgDW = dw: bgDH = dh: bgB = yB
+    End If
+    BeginDraw PreviewPB
+    _PutImage (0, 0), BG
+    _PutImage (dx, dy)-(dx + dw - 1, dy + dh - 1), Img, _Dest, , _Smooth
+    EndDraw PreviewPB
+    If SD < -1 Or SD = 0 Then _Dest SD
+End Sub
+
+' Background for the preview box: a gray 3D "sunken" bevel (BEV px) around the picture and a
+' smooth dark blue -> window blue transition in the margin outside the bevel.  Built once per size.
+Function MM_BuildFrameBG& (W As Long, H As Long, dx As Long, dy As Long, dw As Long, dh As Long, BEV As Long, yB As Long)
+    ' bevel = the outer BEV pixels of the whole box; inside it the fade runs from the dark blue
+    ' (touching the bevel) to the picture's own blue (touching the picture).
+    Dim im As Long, SD As Long
+    Dim x As Long, y As Long
+    Dim dl As Long, dr As Long, dt As Long, db As Long, m As Long
+    Dim mx As Long, my As Long, ex As Double, ey As Double
+    Dim t As Double, g As Long, f As Double, yy As Long
+    SD = _Dest
+    im = _NewImage(W, H, 32)
+    _Dest im
+    mx = dx - BEV: If W - dx - dw - BEV > mx Then mx = W - dx - dw - BEV
+    my = dy - BEV: If H - dy - dh - BEV > my Then my = H - dy - dh - BEV
+    If mx < 1 Then mx = 1
+    If my < 1 Then my = 1
+    For y = 0 To H - 1
+        For x = 0 To W - 1
+            dl = x: dr = W - 1 - x: dt = y: db = H - 1 - y
+            m = dl
+            If dr < m Then m = dr
+            If dt < m Then m = dt
+            If db < m Then m = db
+            If m < BEV Then
+                t = m / (BEV - 1)
+                If (dl = m Or dt = m) And Not (dr = m Or db = m) Then
+                    g = 95 - t * 75
+                Else
+                    g = 235 - t * 70
+                End If
+                PSet (x, y), _RGB32(g, g, g)
+            Else
+                ex = 0: ey = 0
+                If x < dx Then ex = (dx - x) / mx
+                If x > dx + dw - 1 Then ex = (x - (dx + dw - 1)) / mx
+                If y < dy Then ey = (dy - y) / my
+                If y > dy + dh - 1 Then ey = (y - (dy + dh - 1)) / my
+                t = ex: If ey > t Then t = ey
+                If t > 1 Then t = 1
+                t = t * t * (3 - 2 * t)
+                ' blue where the picture edge is blue, black where it is the black text area
+                yy = y: If yy < dy Then yy = dy
+                If yy > dy + dh - 1 Then yy = dy + dh - 1
+                ' blue where the picture edge is blue, black where it is the black text area
+                yy = y: If yy < dy Then yy = dy
+                If yy > dy + dh - 1 Then yy = dy + dh - 1
+                f = (yB - yy + 8) / 16
+                If f < 0 Then f = 0
+                If f > 1 Then f = 1
+                PSet (x, y), _RGB32(0, 0, (175 * f) + (95 - 175 * f) * t)
+            End If
+        Next
+    Next
+    _Dest SD
+    MM_BuildFrameBG = im
+End Function
+
+Sub MM_Blit
+    If MM_PREVIEW_ON And (MM_PREVIEW_IMG < -1) Then
+        MM_BlitImage MM_PREVIEW_IMG
+    Else
+        MM_BlitImage MM_SCR
+    End If
+End Sub
+
+' the very first time Desktop video is chosen: say what it can and can not play on
+Sub MM_DeskWarn
+    Dim F$, fn As Integer
+    If MM_DESKWARNED Then Exit Sub
+    F$ = ProjectHome$ + Slash$ + "DESKTOP_WARNING_SEEN.TXT"
+    If _FileExists(F$) Then MM_DESKWARNED = _TRUE: Exit Sub
+    MessageBox "Desktop videos are meant for the Desktop player or the QB64PE SPV-Handles dev library only." + CRLF + CRLF + "- MJPG and WebP videos (type 99) can not be played on the X16." + CRLF + "- Palettized desktop videos use the X16 video types, but go beyond the X16 limits (size, speed), so they may not play on the X16 either." + CRLF + "- The MS-DOS player plays only types 88 and 86, and the Amiga player (planned) only type 199." + CRLF + CRLF + "Only the Desktop player plays every format." + CRLF + "(This message is shown only once.)", "DESKTOP VIDEO", MsgBox_OkOnly + MsgBox_Information
+    MM_DESKWARNED = _TRUE
+    fn = FreeFile
+    Open F$ For Output As fn
+    Print #fn, "seen"
+    Close fn
+End Sub
