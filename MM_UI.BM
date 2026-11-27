@@ -393,8 +393,10 @@ Sub MM_UpdateUI
         MM_SetChk Pal24CB, _FALSE
     End If
     tallOK = (T = MM_BITMAP Or T = MM_SECTOR Or T = MM_DESKTOP) And (Src_Aspect > 0) And (Src_Aspect < 1) And (M_W = 320 Or M_DESK Or T = MM_DESKTOP)
-    If T = MM_VGA And Src_Aspect > 0 And Src_Aspect < 1 Then
-        ' VGA portrait video: always marked TALL, can not be switched off
+    ' sprite video (standard and high bandwidth): a portrait source with a custom frame size can be marked TALL ("T")
+    If T = MM_SPRITE And S = 9 And Src_Aspect > 0 And Src_Aspect < 1 Then tallOK = _TRUE
+    If (T = MM_VGA And Src_Aspect > 0 And Src_Aspect < 1) Or (T = MM_SPRITE And (S = 3 Or S = 4)) Then
+        ' VGA portrait video, and the two tall sprite sizes (96 x 160, 80 x 144): always marked TALL, can not be switched off
         MM_Show2 TallCB, _TRUE, _FALSE
         MM_SetChk TallCB, _TRUE
         MM_TALLLAST = _FALSE

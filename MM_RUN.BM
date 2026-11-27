@@ -520,6 +520,9 @@ Sub MM_SetUp
         GoTo STARTCONVERSION
     End If
 
+    ' custom sprite size (always the case for high bandwidth sprite): "T" when the TALL box is ticked, else "N"
+    If UserTall And Src_Aspect > 0 And Src_Aspect < 1 Then VideoHeader.HINT = "T" Else VideoHeader.HINT = "N"
+
     ' expert sprite size
     If X_BITS < 8 Then PALETTE_SHIFTING_ENABLED = _FALSE
     Make4BPP_VIDEO = Val(UsedCols$) < 17
